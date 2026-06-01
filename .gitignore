@@ -1,0 +1,32 @@
+# Python sanal ortamı
+.venv/
+venv/
+env/
+
+# Python derleme önbelleği
+__pycache__/
+*.pyc
+*.pyo
+
+# Uygulama çalışma verisi (vektör veritabanı vb.)
+data/
+
+# Gemiye ait teknik dokümanlar (büyük, özel; depoya dahil edilmez)
+Instructions/
+
+# Lokale indirilen / gömülen embedding modelleri
+models/
+
+# PyInstaller çıktıları
+build/
+dist/
+*.spec.bak
+
+# IDE / editör
+.vscode/
+.idea/
+*.swp
+
+# İşletim sistemi
+Thumbs.db
+.DS_Store

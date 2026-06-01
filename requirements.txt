@@ -1,0 +1,41 @@
+# ============================================================================
+#  Gemi Teknik Doküman Asistanı - Bağımlılıklar (requirements.txt)
+# ----------------------------------------------------------------------------
+#  ÖNERİLEN PYTHON SÜRÜMÜ: 3.11 veya 3.12
+#  (PyTorch / EasyOCR / sentence-transformers için Python 3.14'te henüz
+#   kararlı wheel'ler bulunmayabilir. Sanal ortamı 3.11/3.12 ile kurun.)
+#
+#  Kurulum:
+#     python -m venv .venv
+#     .venv\Scripts\activate
+#     pip install -r requirements.txt
+# ============================================================================
+
+# --- Arayüz (UI) ---
+customtkinter==5.2.2
+tkinterdnd2>=0.4.0            # Dosya/klasör sürükle-bırak desteği
+pillow>=10.0.0                 # Görsel önizleme ve OCR ön-işleme
+
+# --- PDF okuma ve render (scanned PDF -> OCR için sayfa görüntüsü üretir) ---
+PyMuPDF>=1.24.0               # 'fitz' modülü
+
+# --- Metin parçalama (chunking) ---
+langchain>=0.2.0
+langchain-text-splitters>=0.2.0
+
+# --- Lokal Embedding modeli ---
+sentence-transformers>=2.7.0
+torch>=2.2.0                   # CPU sürümü yeterlidir (gemi PC'sinde GPU yoksa)
+
+# --- Lokal Vektör Veritabanı (kalıcı/persistent) ---
+chromadb>=0.5.0
+
+# --- Lokal OCR (internetsiz görsel metin okuma) ---
+easyocr>=1.7.1
+
+# --- LLM Bağlantıları ---
+google-generativeai>=0.7.0     # Gemini API (internet varken)
+requests>=2.31.0               # Ollama REST API (localhost, internet yokken)
+
+# --- Paketleme (.exe) ---
+pyinstaller>=6.6.0
