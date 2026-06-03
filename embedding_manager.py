@@ -35,6 +35,23 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 
+def resolve_device(device: str = "auto") -> str:
+    """
+    Kullanılacak cihazı belirler. 'auto' ise CUDA (GPU) varsa 'cuda', yoksa
+    'cpu' döner. Böylece GPU'lu makinede (CUDA'lı torch kuruluysa) otomatik
+    GPU, CPU makinede CPU kullanılır. Belirli bir değer verilirse aynen kullanılır.
+    """
+    if device and device != "auto":
+        return device
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:  # noqa: BLE001
+        pass
+    return "cpu"
+
+
 @dataclass
 class RetrievedContext:
     """Benzerlik aramasından dönen tek bir bağlam parçası."""
@@ -53,9 +70,11 @@ class LocalEmbedder:
     uygulanır (retrieval kalitesini belirgin artırır).
     """
 
-    def __init__(self, model_name_or_path: str, device: str = "cpu") -> None:
+    def __init__(self, model_name_or_path: str, device: str = "auto") -> None:
         self._model_name_or_path = model_name_or_path
-        self._device = device
+        self._device = resolve_device(device)
+        if self._device != "cpu":
+            logger.info("Embedding cihazı: %s", self._device)
         self._model = None
         self._lock = threading.Lock()
         # e5 modelleri özel ön ek ister; model adından otomatik tespit.
@@ -128,7 +147,7 @@ class EmbeddingManager:
         model_name_or_path: str = "intfloat/multilingual-e5-base",
         persist_directory: str = "./vector_store",
         collection_name: str = "gemi_dokumanlari",
-        device: str = "cpu",
+        device: str = "auto",
     ) -> None:
         self.persist_directory = persist_directory
         self.collection_name = collection_name

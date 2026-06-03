@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import queue
 import logging
 import threading
@@ -518,11 +519,25 @@ class GemiAsistaniApp(*_APP_BASES):
         self._set_busy(True, "Cevap üretiliyor...")
 
         def task():
-            # 3) İlgili bağlamı getir (retrieval).
-            contexts = self.embedder.similarity_search(question, k=self.TOP_K)
-            # 4) LLM'den cevap üret (generation).
-            response = self.llm.ask(question, contexts)
-            return response, contexts
+            from perf_monitor import ResourceSampler, format_perf_block
+
+            # Soru sorulduğundan cevap gelene kadarki tüm süreci ölç.
+            with ResourceSampler() as sampler:
+                t0 = time.perf_counter()
+                # 3) İlgili bağlamı getir (retrieval).
+                contexts = self.embedder.similarity_search(question, k=self.TOP_K)
+                t1 = time.perf_counter()
+                # 4) LLM'den cevap üret (generation).
+                response = self.llm.ask(question, contexts)
+                t2 = time.perf_counter()
+
+            timings = {
+                "retrieval_s": round(t1 - t0, 2),
+                "generation_s": round(t2 - t1, 2),
+                "total_s": round(t2 - t0, 2),
+            }
+            perf_text = format_perf_block(timings, response.meta, sampler.summary())
+            return response, contexts, perf_text
 
         def done(result, error):
             self._set_busy(False)
@@ -533,7 +548,7 @@ class GemiAsistaniApp(*_APP_BASES):
                 self.chat.update_message(thinking_label, f"⚠️ Hata: {error}")
                 return
 
-            response, contexts = result
+            response, contexts, perf_text = result
             if not response.success:
                 self.chat.update_message(thinking_label, f"⚠️ {response.error}")
                 return
@@ -546,6 +561,8 @@ class GemiAsistaniApp(*_APP_BASES):
                     for c in contexts
                 })
                 answer += "\n\n📚 Kaynaklar: " + ", ".join(sources)
+            # Performans ölçümünü en sona ekle.
+            answer += "\n\n" + perf_text
             self.chat.update_message(thinking_label, answer)
 
         self._run_in_background(task, on_done=done)

@@ -29,6 +29,7 @@ for pkg in [
     "torch",
     "easyocr",
     "onnxruntime",
+    "google.genai",
 ]:
     try:
         d, b, h = collect_all(pkg)
@@ -41,7 +42,7 @@ for pkg in [
 # Ek gizli importlar (dinamik yüklenenler).
 hiddenimports += [
     "PIL._tkinter_finder",
-    "google.generativeai",
+    "google.genai",
     "langchain_text_splitters",
     "chromadb.telemetry.product.posthog",
     "chromadb.api.segment",

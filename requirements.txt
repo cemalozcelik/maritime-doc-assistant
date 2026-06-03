@@ -34,8 +34,12 @@ chromadb>=0.5.0
 easyocr>=1.7.1
 
 # --- LLM Bağlantıları ---
-google-generativeai>=0.7.0     # Gemini API (internet varken)
+google-genai>=1.0.0            # Gemini API - yeni Google Gen AI SDK (internet varken)
 requests>=2.31.0               # Ollama REST API (localhost, internet yokken)
+
+# --- Performans ölçümü (uygulama içi metrik bloğu ve benchmark.py) ---
+psutil>=5.9.0                  # CPU / RAM ölçümü
+nvidia-ml-py>=12.0.0           # GPU / VRAM ölçümü (NVIDIA; yoksa otomatik atlanır)
 
 # --- Paketleme (.exe) ---
 pyinstaller>=6.6.0

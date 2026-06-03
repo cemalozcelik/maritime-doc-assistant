@@ -3,7 +3,7 @@
 llm_connector.py
 ================
 RAG hattının "Generation" katmanı. Kullanıcının seçimine göre:
-    * Gemini API (internet varken)  -> google-generativeai
+    * Gemini API (internet varken)  -> google-genai (yeni Google Gen AI SDK)
     * Ollama (internet yokken)      -> localhost REST API (llama3, mistral, gemma...)
 
 Sorumluluklar (SRP):
@@ -58,10 +58,19 @@ SYSTEM_PROMPT = (
 class LLMResponse:
     """LLM cevabını ve durum bilgisini taşıyan basit kap."""
 
-    def __init__(self, text: str, success: bool = True, error: str = "") -> None:
+    def __init__(
+        self,
+        text: str,
+        success: bool = True,
+        error: str = "",
+        meta: Optional[dict] = None,
+    ) -> None:
         self.text = text
         self.success = success
         self.error = error
+        # Ölçüm/benchmark için ek bilgi: token sayıları, süreler vb.
+        # (ör. {'input_tokens': 3120, 'output_tokens': 740, 'eval_tps': 41.2})
+        self.meta = meta or {}
 
 
 # ---------------------------------------------------------------------------
@@ -101,37 +110,33 @@ class GeminiConnector(BaseLLMConnector):
     def __init__(self, api_key: str, model_name: str = "gemini-2.5-pro") -> None:
         self.api_key = api_key
         self.model_name = model_name
-        self._model = None
+        self._client = None
 
-    def _genai(self):
+    def _get_client(self):
+        """Yeni Google Gen AI SDK istemcisini (google.genai) hazırlar."""
+        if self._client is not None:
+            return self._client
         try:
-            import google.generativeai as genai
+            from google import genai
         except ImportError as exc:
             raise ImportError(
-                "google-generativeai kurulu değil. "
-                "'pip install google-generativeai' çalıştırın."
+                "google-genai kurulu değil. 'pip install google-genai' çalıştırın. "
+                "(Eski 'google-generativeai' paketi kullanımdan kaldırıldı.)"
             ) from exc
         if not self.api_key:
             raise ValueError("Gemini API anahtarı boş olamaz.")
-        genai.configure(api_key=self.api_key)
-        return genai
-
-    def _ensure_model(self):
-        if self._model is not None:
-            return self._model
-        genai = self._genai()
-        self._model = genai.GenerativeModel(self.model_name)
-        return self._model
+        self._client = genai.Client(api_key=self.api_key)
+        return self._client
 
     def _list_supported_models(self) -> List[str]:
         """API'de 'generateContent' destekleyen modelleri listeler (kısa adlarıyla)."""
-        genai = self._genai()
+        client = self._get_client()
         names: List[str] = []
-        for m in genai.list_models():
-            methods = getattr(m, "supported_generation_methods", []) or []
-            if "generateContent" in methods:
-                # "models/gemini-2.5-flash" -> "gemini-2.5-flash"
-                names.append(getattr(m, "name", "").split("/")[-1])
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            if "generateContent" in actions:
+                # "models/gemini-2.5-pro" -> "gemini-2.5-pro"
+                names.append((getattr(m, "name", "") or "").split("/")[-1])
         return [n for n in names if n]
 
     def _resolve_available_model(self) -> Optional[str]:
@@ -157,12 +162,14 @@ class GeminiConnector(BaseLLMConnector):
 
     def generate(self, prompt: str) -> LLMResponse:
         try:
-            model = self._ensure_model()
-            response = model.generate_content(prompt)
+            client = self._get_client()
+            response = client.models.generate_content(
+                model=self.model_name, contents=prompt
+            )
             text = (getattr(response, "text", "") or "").strip()
             if not text:
                 return LLMResponse("", success=False, error="Gemini boş cevap döndürdü.")
-            return LLMResponse(text)
+            return LLMResponse(text, meta=self._build_meta(response))
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             # Model adı geçersiz/desteklenmiyorsa: API'den uygun model bul ve bir kez yeniden dene.
@@ -172,13 +179,14 @@ class GeminiConnector(BaseLLMConnector):
                     logger.info("Gemini modeli '%s' kullanılamadı; '%s' ile yeniden deneniyor.",
                                 self.model_name, resolved)
                     self.model_name = resolved
-                    self._model = None
                     try:
-                        model = self._ensure_model()
-                        response = model.generate_content(prompt)
+                        client = self._get_client()
+                        response = client.models.generate_content(
+                            model=self.model_name, contents=prompt
+                        )
                         text = (getattr(response, "text", "") or "").strip()
                         if text:
-                            return LLMResponse(text)
+                            return LLMResponse(text, meta=self._build_meta(response))
                     except Exception as exc2:  # noqa: BLE001
                         exc = exc2
                         msg = str(exc2)
@@ -188,6 +196,22 @@ class GeminiConnector(BaseLLMConnector):
                 success=False,
                 error=f"Gemini bağlantı hatası (internet/anahtar/model kontrol edin): {exc}",
             )
+
+    def _build_meta(self, response) -> dict:
+        """Gemini yanıtının usage_metadata'sından token sayılarını çıkarır."""
+        meta = {"provider": "gemini", "model": self.model_name}
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            in_tok = getattr(usage, "prompt_token_count", None)
+            out_tok = getattr(usage, "candidates_token_count", None)
+            meta.update({
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "total_tokens": getattr(usage, "total_token_count", None),
+                # 'Thinking' modellerinde düşünme token'ları (varsa).
+                "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+            })
+        return meta
 
     def is_available(self) -> bool:
         """API anahtarı var mı ve internet erişilebilir mi (basit kontrol)."""
@@ -251,6 +275,7 @@ class OllamaConnector(BaseLLMConnector):
             resp.raise_for_status()
 
             parts: List[str] = []
+            final: dict = {}
             for line in resp.iter_lines(decode_unicode=True):
                 if not line:
                     continue
@@ -260,11 +285,12 @@ class OllamaConnector(BaseLLMConnector):
                     continue  # Bozuk/yarım satırı atla.
                 parts.append(chunk.get("response", "") or "")
                 if chunk.get("done"):
+                    final = chunk  # Son chunk token sayıları/süreleri içerir.
                     break
             text = "".join(parts).strip()
             if not text:
                 return LLMResponse("", success=False, error="Ollama boş cevap döndürdü.")
-            return LLMResponse(text)
+            return LLMResponse(text, meta=self._build_meta(final))
         except requests.exceptions.ConnectionError:
             return LLMResponse(
                 "",
@@ -282,6 +308,35 @@ class OllamaConnector(BaseLLMConnector):
         except Exception as exc:  # noqa: BLE001
             logger.error("Ollama hatası: %s", exc)
             return LLMResponse("", success=False, error=f"Ollama hatası: {exc}")
+
+    @staticmethod
+    def _build_meta(final: dict) -> dict:
+        """
+        Ollama'nın son (done) chunk'ındaki ölçüm verilerini standart bir sözlüğe
+        çevirir. Süreler nanosaniyedir; saniyeye ve token/sn'ye dönüştürülür.
+        """
+        if not final:
+            return {}
+        ns = 1e9
+        in_tok = final.get("prompt_eval_count")
+        out_tok = final.get("eval_count")
+        eval_dur = final.get("eval_duration")        # çıktı üretim süresi (ns)
+        prompt_dur = final.get("prompt_eval_duration")  # girdi işleme süresi (ns)
+        meta = {
+            "provider": "ollama",
+            "model": final.get("model"),
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "total_tokens": (in_tok + out_tok) if (in_tok and out_tok) else None,
+            "load_s": (final.get("load_duration") or 0) / ns or None,
+            "prompt_eval_s": (prompt_dur / ns) if prompt_dur else None,
+            "eval_s": (eval_dur / ns) if eval_dur else None,
+            "total_s": (final.get("total_duration") or 0) / ns or None,
+        }
+        # Üretim hızı (token/saniye) — modelin saf çıktı hızı.
+        if out_tok and eval_dur:
+            meta["output_tps"] = round(out_tok / (eval_dur / ns), 2)
+        return meta
 
     def is_available(self) -> bool:
         """Ollama sunucusu ayakta mı?"""

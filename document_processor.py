@@ -105,17 +105,21 @@ class DocumentProcessor:
         chunk_overlap: int = 200,
         ocr_languages: Optional[List[str]] = None,
         enable_pdf_ocr_fallback: bool = True,
+        ocr_gpu: Optional[bool] = None,
     ) -> None:
         """
         :param chunk_size: Her metin parçasının maksimum karakter uzunluğu.
         :param chunk_overlap: Bağlamı korumak için parçalar arası örtüşme miktarı.
         :param ocr_languages: OCR dilleri (varsayılan: Türkçe + İngilizce).
         :param enable_pdf_ocr_fallback: Metinsiz PDF sayfalarında OCR denensin mi?
+        :param ocr_gpu: OCR için GPU kullanılsın mı? None ise otomatik algılanır
+                        (CUDA'lı torch varsa GPU, yoksa CPU).
         """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.ocr_languages = ocr_languages or ["tr", "en"]
         self.enable_pdf_ocr_fallback = enable_pdf_ocr_fallback
+        self._ocr_gpu = ocr_gpu  # None = otomatik
 
         # OCR motoru ilk kullanımda yüklenecek (lazy).
         self._ocr_reader = None
@@ -138,6 +142,16 @@ class DocumentProcessor:
     # ------------------------------------------------------------------ #
     #  OCR Motoru (Lazy Loading)
     # ------------------------------------------------------------------ #
+    def _detect_gpu(self) -> bool:
+        """OCR için GPU kullanılıp kullanılmayacağını belirler (override veya otomatik)."""
+        if self._ocr_gpu is not None:
+            return self._ocr_gpu
+        try:
+            import torch
+            return bool(torch.cuda.is_available())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _get_ocr_reader(self):
         """EasyOCR okuyucusunu gerektiğinde (ilk OCR ihtiyacında) başlatır."""
         if self._ocr_reader is not None:
@@ -145,9 +159,14 @@ class DocumentProcessor:
 
         try:
             import easyocr  # Ağır bir import olduğu için fonksiyon içinde yapılıyor.
-            logger.info("EasyOCR motoru yükleniyor (diller: %s)...", self.ocr_languages)
-            # gpu=False -> Gemi bilgisayarlarında GPU olmayabilir, CPU güvenli seçim.
-            self._ocr_reader = easyocr.Reader(self.ocr_languages, gpu=False)
+            # GPU'yu otomatik algıla: CUDA'lı torch varsa GPU kullan (taramaları
+            # belirgin hızlandırır), yoksa CPU'ya düş (güvenli varsayılan).
+            use_gpu = self._detect_gpu()
+            logger.info(
+                "EasyOCR motoru yükleniyor (diller: %s, GPU: %s)...",
+                self.ocr_languages, use_gpu,
+            )
+            self._ocr_reader = easyocr.Reader(self.ocr_languages, gpu=use_gpu)
             logger.info("EasyOCR motoru hazır.")
             return self._ocr_reader
         except Exception as exc:  # noqa: BLE001
