@@ -25,7 +25,16 @@ langchain-text-splitters>=0.2.0
 
 # --- Lokal Embedding modeli ---
 sentence-transformers>=2.7.0
-torch>=2.2.0                   # CPU sürümü yeterlidir (gemi PC'sinde GPU yoksa)
+#
+# PyTorch: torch ve torchvision SÜRÜMLERİ BİRBİRİYLE EŞLEŞMELİDİR; aksi halde
+# "operator torchvision::nms does not exist" hatası alınır. İkisini birlikte,
+# tek komutla kurun ki pip uyumlu çifti seçsin.
+#   Varsayılan (CPU): aşağıdaki satırlar PyPI'den uyumlu CPU çiftini kurar.
+#   GPU (CUDA) için: ikisini eşleşen CUDA çiftiyle değiştirin (sürücüye uygun
+#   cuXXX seçin), örn. CUDA 12.1:
+#       pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision
+torch>=2.2.0
+torchvision>=0.17.0            # transformers/easyocr için gerekli; torch ile eşleşmeli
 
 # --- Lokal Vektör Veritabanı (kalıcı/persistent) ---
 chromadb>=0.5.0
