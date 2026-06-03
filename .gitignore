@@ -13,6 +13,8 @@ data/
 
 # Gemiye ait teknik dokümanlar (büyük, özel; depoya dahil edilmez)
 Instructions/
+Instructions.rar
+*.rar
 
 # Lokale indirilen / gömülen embedding modelleri
 models/

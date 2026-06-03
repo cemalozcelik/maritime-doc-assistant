@@ -289,12 +289,47 @@ class ChatArea(ctk.CTkFrame):
             bubble, text=text, font=ctk.CTkFont(size=14),
             justify="left", anchor="w", wraplength=620,
         )
-        msg_label.pack(anchor="w", padx=12, pady=(2, 8))
+        msg_label.pack(anchor="w", padx=12, pady=(2, 4))
+
+        # Mesaj metnini panoya kopyalama butonu.
+        copy_btn = ctk.CTkButton(
+            bubble, text="📋 Kopyala", width=90, height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent", border_width=1, hover_color="#4a4d50",
+        )
+        copy_btn.configure(
+            command=lambda lbl=msg_label, btn=copy_btn: self._copy_to_clipboard(lbl, btn)
+        )
+        copy_btn.pack(anchor="e", padx=12, pady=(0, 8))
 
         self._row += 1
         # Yeni mesaja otomatik kaydır.
         self.after(50, self._scroll_to_bottom)
         return msg_label
+
+    def _copy_to_clipboard(self, label: ctk.CTkLabel, button: ctk.CTkButton) -> None:
+        """İlgili mesaj balonunun o anki metnini panoya kopyalar."""
+        try:
+            text = label.cget("text")
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()  # Panoya yazmanın tamamlanmasını garanti et.
+        except Exception:  # noqa: BLE001
+            return
+        # Kısa görsel geri bildirim: "✓ Kopyalandı" -> 1.5 sn sonra eski metne dön.
+        try:
+            button.configure(text="✓ Kopyalandı")
+            self.after(1500, lambda: self._reset_copy_button(button))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _reset_copy_button(button: ctk.CTkButton) -> None:
+        """Kopyala butonunu eski metnine döndürür (widget hâlâ varsa)."""
+        try:
+            button.configure(text="📋 Kopyala")
+        except Exception:  # noqa: BLE001
+            pass
 
     def update_message(self, label: ctk.CTkLabel, text: str) -> None:
         """Mevcut bir mesaj balonunun metnini günceller (örn. 'Yazıyor...' -> cevap)."""

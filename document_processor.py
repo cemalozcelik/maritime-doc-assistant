@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import io
+import re
 import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -80,6 +81,20 @@ class DocumentProcessor:
     # OCR uygulanmadan önce PDF'ten en az bu kadar karakter çıkmalı.
     # Daha azı çıkarsa sayfa "taranmış (scanned)" kabul edilip OCR'a yönlendirilir.
     MIN_TEXT_THRESHOLD = 20
+
+    # --- Metin kalite filtresi eşikleri (OCR çöpünü ayıklamak için) ---
+    # Taranmış teknik çizim/diyagramların OCR'ı çoğu zaman anlamsız karakter
+    # çorbası üretir (ör. "MGONTRgE OYSTFGNE", "63620 r 1 ~ C) l\"T1"). Bu tür
+    # parçalar veritabanını kirletip alakasız sonuçların en üste çıkmasına yol
+    # açar. Aşağıdaki ölçütlerden biri bile sağlanmazsa parça "düşük kaliteli"
+    # sayılıp atılır.
+    MIN_CHUNK_CHARS = 15          # Bu uzunluğun altındaki parçalar atılır.
+    MIN_ALPHA_RATIO = 0.50        # Harf / toplam karakter oranı en az.
+    MIN_WORD_RATIO = 0.50         # Kelime-benzeri token / toplam token oranı en az.
+    MIN_WORD_COUNT = 3            # En az bu kadar kelime-benzeri token olmalı.
+    MIN_VOWEL_RATIO = 0.20        # Harfler içinde ünlü oranı en az (gibberish eler).
+    _VOWELS = set("aeiouâîûöüıAEIOUÂÎÛÖÜI")
+    _WORD_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü]{2,}")
 
     SUPPORTED_PDF = (".pdf",)
     SUPPORTED_IMAGE = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp")
@@ -307,7 +322,45 @@ class DocumentProcessor:
     #  Metin Parçalama
     # ------------------------------------------------------------------ #
     def _split_text(self, text: str) -> List[str]:
-        """Uzun metni, bağlamı koruyan örtüşmeli parçalara böler."""
+        """
+        Uzun metni, bağlamı koruyan örtüşmeli parçalara böler ve düşük kaliteli
+        (OCR çöpü) parçaları ayıklar.
+        """
         if not text:
             return []
-        return [chunk.strip() for chunk in self._splitter.split_text(text) if chunk.strip()]
+        pieces = (chunk.strip() for chunk in self._splitter.split_text(text))
+        return [p for p in pieces if p and not self._is_low_quality(p)]
+
+    def _is_low_quality(self, text: str) -> bool:
+        """
+        Bir metin parçasının anlamsız OCR çöpü olup olmadığını sezgisel olarak
+        değerlendirir. Gerçek (TR/EN) cümleleri korur; taranmış çizimlerden çıkan
+        karakter çorbasını eler. Sözlük/kütüphane gerektirmez (tamamen lokal).
+        """
+        t = text.strip()
+        if len(t) < self.MIN_CHUNK_CHARS:
+            return True
+
+        letters = sum(1 for c in t if c.isalpha())
+        if letters == 0:
+            return True
+
+        # 1) Harf oranı: çoğunluk sembol/rakamsa muhtemelen çizim/tablo çöpü.
+        if letters / len(t) < self.MIN_ALPHA_RATIO:
+            return True
+
+        tokens = t.split()
+        words = self._WORD_RE.findall(t)
+        # 2) Token'ların çoğu kelime-benzeri değilse (kopuk semboller) ele.
+        if not tokens or len(words) / len(tokens) < self.MIN_WORD_RATIO:
+            return True
+        # 3) Anlamlı olabilmesi için en az birkaç gerçek kelime olmalı.
+        if len(words) < self.MIN_WORD_COUNT:
+            return True
+
+        # 4) Ünlü oranı çok düşükse (ör. "MGONTRG ZXCV") gibberish kabul et.
+        vowels = sum(1 for c in t if c in self._VOWELS)
+        if vowels / letters < self.MIN_VOWEL_RATIO:
+            return True
+
+        return False

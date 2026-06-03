@@ -107,6 +107,42 @@ def local_embedding_model_path(model_name: str) -> str:
     return model_name
 
 
+def enable_hf_offline_if_available(model_name: str) -> None:
+    """
+    Embedding modeli lokalde (projedeki 'models/' klasöründe veya Hugging Face
+    cache'inde) zaten mevcutsa, Hugging Face'i TAMAMEN çevrimdışı moda alır.
+
+    Neden: huggingface_hub 1.x sürümü, model lokalde olsa bile yüklerken Hub'a
+    (internete) bağlanıp güncelleme kontrolü yapmaya çalışır ve yeni httpx
+    istemcisi bazen 'Cannot send a request, as the client has been closed'
+    hatası verir. Çevrimdışı moda alınca Hub'a hiç gidilmez; bu hem hatayı
+    önler hem de gemideki internetsiz kullanım için zaten doğru davranıştır.
+
+    Önemli: Model HENÜZ indirilmemişse offline'a ALINMAZ; böylece ilk
+    çalıştırmada internetten indirilebilir.
+    """
+    # 1) Projeye gömülü 'models/<isim>' klasörü var mı?
+    safe_name = model_name.replace("/", "_")
+    if os.path.isdir(resource_path(os.path.join("models", safe_name))):
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        logger.info("Embedding modeli gömülü; Hugging Face çevrimdışı moda alındı.")
+        return
+
+    # 2) Hugging Face cache'inde indirilmiş mi?
+    try:
+        from huggingface_hub import constants  # type: ignore
+
+        repo_dir = "models--" + model_name.replace("/", "--")
+        snapshots = os.path.join(constants.HF_HUB_CACHE, repo_dir, "snapshots")
+        if os.path.isdir(snapshots) and os.listdir(snapshots):
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            logger.info("Embedding modeli cache'te; Hugging Face çevrimdışı moda alındı.")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("HF cache kontrolü atlandı: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 #  Ana Uygulama
 # ---------------------------------------------------------------------------
@@ -123,7 +159,7 @@ class GemiAsistaniApp(*_APP_BASES):
     """Uygulamanın ana penceresi ve koordinatörü."""
 
     EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
-    TOP_K = 4  # Her soruda kaç bağlam parçası getirilsin.
+    TOP_K = 8  # Her soruda kaç bağlam parçası getirilsin (eşik elemesinden sonra).
 
     def __init__(self) -> None:
         super().__init__()
@@ -131,6 +167,10 @@ class GemiAsistaniApp(*_APP_BASES):
         self.title("Gemi Teknik Doküman Asistanı")
         self.geometry("1100x720")
         self.minsize(900, 600)
+
+        # Model lokalde mevcutsa Hugging Face'i çevrimdışı moda al (model
+        # yüklemeden ÖNCE ayarlanmalı; httpx 'client closed' hatasını önler).
+        enable_hf_offline_if_available(self.EMBEDDING_MODEL)
 
         # --- İş modüllerini hazırla (modeller lazy yüklenir) ---
         self.processor = DocumentProcessor(chunk_size=1000, chunk_overlap=200)
@@ -335,9 +375,23 @@ class GemiAsistaniApp(*_APP_BASES):
 
         def task():
             total_chunks = 0
+            skipped = 0
             messages = []
+            # Veritabanında zaten kayıtlı kaynak adları (dosya adı bazında).
+            # Aynı klasörü tekrar seçince mevcut dosyalar yeniden işlenmesin.
+            existing = set(self.embedder.list_sources())
             for index, path in enumerate(paths, start=1):
                 name = os.path.basename(path)
+                # Zaten yüklüyse (veya aynı seçimde mükerrer geldiyse) atla.
+                if name in existing:
+                    skipped += 1
+                    messages.append(f"• {name}: zaten yüklü, atlandı")
+                    self._post_ui(
+                        lambda n=name, i=index: self.sidebar.set_status(
+                            f"Atlanıyor ({i}/{total}): {n} (zaten yüklü)", "orange"
+                        )
+                    )
+                    continue
                 self._post_ui(
                     lambda n=name, i=index: self.sidebar.set_status(
                         f"İşleniyor ({i}/{total}): {n}", "orange"
@@ -347,10 +401,12 @@ class GemiAsistaniApp(*_APP_BASES):
                 if result.success and result.chunks:
                     added = self.embedder.add_chunks(result.chunks)
                     total_chunks += added
+                    # Bu oturumda işlendi; aynı ad tekrar gelirse bir daha ekleme.
+                    existing.add(name)
                     messages.append(f"✓ {result.message}")
                 else:
                     messages.append(f"✗ {result.message}")
-            return total_chunks, messages
+            return total_chunks, skipped, messages
 
         def done(result, error):
             self._set_busy(False)
@@ -358,7 +414,7 @@ class GemiAsistaniApp(*_APP_BASES):
                 self.sidebar.set_status("İşleme hatası!", "red")
                 messagebox.showerror("Hata", f"Doküman işlenirken hata oluştu:\n{error}")
                 return
-            _total_chunks, messages = result
+            _total_chunks, skipped, messages = result
             self.sidebar.set_documents(self.embedder.list_sources())
             count = self.embedder.get_document_count()
             self.sidebar.set_status(f"Hazır ({count} parça)", "lightgreen")
@@ -367,8 +423,11 @@ class GemiAsistaniApp(*_APP_BASES):
                 shown = messages[:15] + [f"... ve {len(messages) - 15} dosya daha"]
             else:
                 shown = messages
+            ozet = "Yükleme tamamlandı"
+            if skipped:
+                ozet += f" ({skipped} dosya zaten yüklüydü, atlandı)"
             self.chat.add_message(
-                "Sistem", "Yükleme tamamlandı:\n" + "\n".join(shown), is_user=False
+                "Sistem", ozet + ":\n" + "\n".join(shown), is_user=False
             )
 
         self._run_in_background(task, on_done=done)

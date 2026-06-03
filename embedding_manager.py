@@ -247,14 +247,34 @@ class EmbeddingManager:
     # ------------------------------------------------------------------ #
     #  Okuma / Arama
     # ------------------------------------------------------------------ #
-    def similarity_search(self, query: str, k: int = 4) -> List[RetrievedContext]:
+    # Kosinüs mesafesi eşiği (0 = aynı, 2 = zıt). Bu değerden UZAK (büyük) parçalar
+    # alakasız kabul edilip elenir. e5 modelinde ilgili parçalar tipik olarak
+    # ~0.0-0.45 aralığında, alakasız/çöp (çizim OCR'ı vb.) ise daha büyük çıkar.
+    # Çok düşük tutarsanız hiç sonuç gelmez; çok yüksek tutarsanız çöp sızar.
+    DEFAULT_MAX_DISTANCE = 0.55
+
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 4,
+        max_distance: Optional[float] = None,
+    ) -> List[RetrievedContext]:
         """
         Soruya en benzer 'k' adet bağlam parçasını döndürür.
-        Veritabanı boşsa boş liste döner (hata fırlatmaz).
+
+        Önce 'k'dan daha fazla aday çeker, ardından kosinüs mesafesi
+        'max_distance' eşiğinden büyük (alakasız) olanları eler ve geriye
+        kalanların en iyi 'k' tanesini döndürür. Böylece çizim OCR'ı gibi
+        anlamsız parçalar bağlama girmez. Veritabanı boşsa boş liste döner.
+
+        :param max_distance: None ise sınıf varsayılanı (DEFAULT_MAX_DISTANCE)
+                             kullanılır. Eşiği geçen parça yoksa boş liste döner
+                             (bu durumda LLM 'dokümanda bulunmuyor' demeli).
         """
         if not query or not query.strip():
             return []
 
+        threshold = self.DEFAULT_MAX_DISTANCE if max_distance is None else max_distance
         collection = self._ensure_collection()
 
         try:
@@ -262,30 +282,38 @@ class EmbeddingManager:
             if count == 0:
                 return []
 
+            # Eşik elemesinin işe yaraması için 'k'dan fazla aday çek.
+            fetch_k = min(count, max(k * 3, 20))
             query_embedding = self._embedder.embed_query(query)
             results = collection.query(
                 query_embeddings=[query_embedding],
-                n_results=min(k, count),
+                n_results=fetch_k,
                 include=["documents", "metadatas", "distances"],
             )
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Benzerlik araması başarısız: {exc}") from exc
 
-        contexts: List[RetrievedContext] = []
         documents = (results.get("documents") or [[]])[0]
         metadatas = (results.get("metadatas") or [[]])[0]
         distances = (results.get("distances") or [[]])[0]
 
+        contexts: List[RetrievedContext] = []
         for doc, meta, dist in zip(documents, metadatas, distances):
+            distance = float(dist)
+            # Eşikten uzak (alakasız) parçaları ele.
+            if distance > threshold:
+                continue
             contexts.append(
                 RetrievedContext(
                     text=doc,
                     source=(meta or {}).get("source", "bilinmiyor"),
                     page=(meta or {}).get("page", 0),
-                    score=float(dist),
+                    score=distance,
                 )
             )
-        return contexts
+
+        # ChromaDB zaten mesafeye göre artan sıralı döndürür; en iyi 'k' tanesini al.
+        return contexts[:k]
 
     # ------------------------------------------------------------------ #
     #  Yardımcı / Yönetim
