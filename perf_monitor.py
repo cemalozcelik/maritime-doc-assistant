@@ -121,21 +121,26 @@ def format_perf_block(timings: dict, meta: dict, res: dict) -> str:
     tot = timings.get("total_s")
     tps = round(ot / gen, 1) if (ot and gen) else meta.get("output_tps")
 
+    # Model satırı: ad + (varsa) parametre sayısı ve quantization.
+    extra = [x for x in (meta.get("parameters"), meta.get("quantization")) if x]
+    model_line = _v(meta.get("model")) + (f"  [{' · '.join(extra)}]" if extra else "")
+
     lines = [
-        "──────────── ⚙️  Performans Ölçümü ────────────",
-        f"🔢 Token   : girdi {_v(it)} · çıktı {_v(ot)} · toplam {_v(tt)}",
-        f"⏱️ Süre    : getirme {_v(ret, ' s')} · üretim {_v(gen, ' s')} · toplam {_v(tot, ' s')}",
-        f"🚀 Hız     : {_v(tps, ' tok/sn')}",
-        f"🖥️ CPU     : ort %{_v(res.get('cpu_avg'))} · max %{_v(res.get('cpu_max'))}",
-        f"💾 RAM     : ort {_v(res.get('ram_avg_mb'), ' MB')} · max {_v(res.get('ram_max_mb'), ' MB')}",
+        "──────────────── PERFORMANS ÖLÇÜMÜ ────────────────",
+        f"{'Model':<6}: {model_line}",
+        f"{'Token':<6}: girdi {_v(it)} · çıktı {_v(ot)} · toplam {_v(tt)}",
+        f"{'Süre':<6}: getirme {_v(ret, ' s')} · üretim {_v(gen, ' s')} · toplam {_v(tot, ' s')}",
+        f"{'Hız':<6}: {_v(tps, ' tok/sn')}",
+        f"{'CPU':<6}: ort %{_v(res.get('cpu_avg'))} · max %{_v(res.get('cpu_max'))}",
+        f"{'RAM':<6}: ort {_v(res.get('ram_avg_mb'), ' MB')} · max {_v(res.get('ram_max_mb'), ' MB')}",
     ]
     # GPU/VRAM yalnızca ölçülebildiyse göster.
     if res.get("gpu_max") is not None or res.get("vram_max_mb") is not None:
         lines.append(
-            f"🎮 GPU     : ort %{_v(res.get('gpu_avg'))} · max %{_v(res.get('gpu_max'))}"
+            f"{'GPU':<6}: ort %{_v(res.get('gpu_avg'))} · max %{_v(res.get('gpu_max'))}"
         )
         lines.append(
-            f"🟩 VRAM    : ort {_v(res.get('vram_avg_mb'), ' MB')} · max {_v(res.get('vram_max_mb'), ' MB')}"
+            f"{'VRAM':<6}: ort {_v(res.get('vram_avg_mb'), ' MB')} · max {_v(res.get('vram_max_mb'), ' MB')}"
         )
-    lines.append("──────────────────────────────────────────────")
+    lines.append("────────────────────────────────────────────────────")
     return "\n".join(lines)

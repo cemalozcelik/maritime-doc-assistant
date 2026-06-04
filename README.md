@@ -24,17 +24,31 @@ seçildiğinde gereklidir.
 
 ## Temel Özellikler
 
-- Çift dil modeli sağlayıcısı: internet varken Gemini API, yokken Ollama
-  (llama3, mistral, gemma vb.). Arayüzden tek tıkla geçiş.
+- Çift dil modeli sağlayıcısı: internet varken Gemini API (varsayılan
+  gemini-2.5-pro), yokken Ollama (llama3, mistral, gemma vb.). Arayüzden tek tıkla
+  geçiş. Gemini bağlantısı güncel google-genai SDK'sı ile kurulur.
+- Etiketli hibrit yanıt: cevap önce yüklenen dokümana dayanır ("DOKÜMANDAN"),
+  gerektiğinde genel mühendislik bilgisi ayrı ve açıkça etiketlenerek ("GENEL
+  MÜHENDİSLİK BİLGİSİ — dokümanda doğrulanmadı") eklenir. Sayı ve parça numaraları
+  asla uydurulmaz; her cevapta kaynak ve sayfa bilgisi verilir.
+- Uygulama içi performans ölçümü: her cevabın sonuna token sayısı (girdi/çıktı),
+  süre (getirme/üretim), hız (tok/sn) ve sorgu boyunca ölçülen CPU/RAM/GPU/VRAM
+  (ortalama ve zirve) ile kullanılan model, parametre sayısı ve quantization
+  bilgisi düz metin bir blok olarak eklenir.
 - Lokal RAG: yanıtlar yalnızca yüklenen dokümanlardaki bağlama dayanır; cevaplarda
   kaynak ve sayfa bilgisi belirtilir.
 - Çoklu yükleme yöntemi: tek tek dosya, komple klasör (alt klasörler dahil) veya
-  pencereye sürükle-bırak.
+  pencereye sürükle-bırak. Aynı dosya ikinci kez yüklenmek istendiğinde tekrar
+  işlenmez, atlanır.
 - Lokal OCR: görsellerdeki ve taranmış PDF sayfalarındaki metinleri internetsiz okur
-  (EasyOCR, Türkçe + İngilizce).
+  (EasyOCR, Türkçe + İngilizce); GPU varsa otomatik kullanılır.
 - Kalıcı vektör veritabanı: ChromaDB ile veriler diske yazılır; uygulama kapatılsa
   bile dokümanlar korunur.
-- Türkçe ve İngilizce embedding: intfloat/multilingual-e5-base modeli.
+- Türkçe ve İngilizce embedding: intfloat/multilingual-e5-base modeli; GPU varsa
+  otomatik olarak CUDA üzerinde çalışır.
+- Gerçek çevrimdışı çalışma: model lokalde mevcutsa Hugging Face açılışta otomatik
+  çevrimdışı moda alınır, internet yokken ağ çağrısı denenmez.
+- Yanıtı tek tıkla panoya kopyalama düğmesi.
 - Yanıt veren arayüz: tüm ağır işlemler (OCR, embedding, dil modeli çağrıları) arka
   plan iş parçacıklarında yürütülür.
 - Windows için tek klasörlük .exe paketleme desteği (PyInstaller).
@@ -53,6 +67,8 @@ maritime-doc-assistant/
 ├── document_processor.py   PDF okuma, metin parçalama, görsel/taranmış PDF OCR
 ├── embedding_manager.py    Lokal embedding, ChromaDB, benzerlik araması (RAG retrieval)
 ├── llm_connector.py        Gemini / Ollama bağlantısı ve prompt yönetimi (RAG generation)
+├── perf_monitor.py         CPU/RAM/GPU/VRAM örnekleme ve performans bloğu biçimlendirme
+├── benchmark.py            Uçtan uca performans ölçüm (benchmark) aracı (komut satırı)
 ├── requirements.txt        Bağımlılıklar
 ├── gemi_asistani.spec      PyInstaller paketleme yapılandırması
 └── build.bat               Tek komutla .exe derleme betiği
@@ -107,6 +123,36 @@ modelleri bir kez indirilir. Sonraki çalıştırmalar internetsiz gerçekleşir
 ```powershell
 ollama pull llama3      # alternatif: mistral, gemma
 ```
+
+---
+
+## Performans Ölçümü
+
+Tez/rapor için RAG hattının performansı iki yoldan ölçülebilir:
+
+- Uygulama içi: her cevabın sonuna otomatik olarak eklenen performans bloğu
+  (token, süre, hız ve CPU/RAM/GPU/VRAM ortalama/zirve değerleri ile model adı,
+  parametre sayısı ve quantization). Temiz ölçüm için uygulama, model başına
+  açılıp kapatılarak kullanılır; ölçüm soru gönderildiği andan cevap gelene kadarki
+  kullanımı kapsar.
+- Komut satırı: birden fazla soruyu (ve tekrarları) toplu çalıştırıp sonuçları
+  tablo ve CSV olarak veren `benchmark.py`:
+
+```powershell
+# Ollama (lokal):
+python benchmark.py --provider ollama --model llama3.1:8b --repeat 3
+
+# Gemini:
+python benchmark.py --provider gemini --model gemini-2.5-pro --api-key XYZ
+```
+
+GPU/VRAM ölçümü için `psutil` ve `nvidia-ml-py` paketleri gerekir (requirements
+içinde yer alır). NVIDIA GPU yoksa ilgili metrikler atlanır.
+
+Not: Bir dil modelinin GPU ile hızlı çalışabilmesi için VRAM'e sığması gerekir.
+VRAM'i aşan modellerin bir kısmı CPU'ya taşar ve hız belirgin biçimde düşer; bu
+durum performans bloğundaki düşük GPU kullanımı ve yüksek RAM değerlerinden
+gözlemlenebilir.
 
 ---
 
@@ -170,7 +216,8 @@ Paketleme sırasında dikkat edilmesi gereken noktalar:
 | Metin parçalama   | LangChain RecursiveCharacterTextSplitter             |
 | Embedding         | sentence-transformers, intfloat/multilingual-e5-base |
 | Vektör veritabanı | ChromaDB (persistent)                                |
-| Dil modeli        | Google Gemini API, Ollama (lokal)                    |
+| Dil modeli        | Google Gemini API (google-genai), Ollama (lokal)     |
+| Performans ölçümü | psutil, nvidia-ml-py (pynvml)                        |
 | Paketleme         | PyInstaller                                          |
 
 ---

@@ -80,6 +80,8 @@ def run_query(embedder: EmbeddingManager, llm: LLMConnector, question: str) -> d
     row.update({
         "ok": response.success,
         "n_contexts": len(contexts),
+        "parameters": meta.get("parameters"),       # ör. 31.3B
+        "quantization": meta.get("quantization"),   # ör. Q4_K_M
         "input_tokens": meta.get("input_tokens"),
         "output_tokens": meta.get("output_tokens"),
         "total_tokens": meta.get("total_tokens"),
@@ -220,7 +222,8 @@ def main() -> None:
 
     # CSV yaz.
     fieldnames = [
-        "question", "ok", "n_contexts", "input_tokens", "output_tokens",
+        "question", "ok", "n_contexts", "parameters", "quantization",
+        "input_tokens", "output_tokens",
         "total_tokens", "model_output_tps", "e2e_tps", "retrieval_s",
         "generation_s", "total_s", "cpu_avg", "cpu_max", "ram_avg_mb",
         "ram_max_mb", "gpu_avg", "gpu_max", "vram_avg_mb", "vram_max_mb", "error",

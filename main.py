@@ -25,22 +25,6 @@ import time
 import queue
 import logging
 import threading
-from tkinter import filedialog, messagebox
-
-import customtkinter as ctk
-
-from ui_components import Sidebar, ChatArea
-from document_processor import DocumentProcessor
-from embedding_manager import EmbeddingManager
-from llm_connector import LLMConnector
-
-# Sürükle-bırak (opsiyonel). Kütüphane yoksa özellik sessizce devre dışı kalır;
-# dosya/klasör seçme butonları her durumda çalışmaya devam eder.
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-    _DND_AVAILABLE = True
-except ImportError:
-    _DND_AVAILABLE = False
 
 # --- Loglama ---
 logging.basicConfig(
@@ -49,10 +33,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# Kullanılan embedding modeli. Çevrimdışı kontrolü, ağır kütüphaneler
+# (transformers/huggingface_hub) import EDİLMEDEN ÖNCE yapılmalı; bu yüzden bu
+# sabit ve yardımcılar dosyanın en başında tanımlanır.
+EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
 
-# ---------------------------------------------------------------------------
-#  Yol Yardımcıları (PyInstaller uyumlu)
-# ---------------------------------------------------------------------------
+
 def resource_path(relative: str) -> str:
     """
     Salt-okunur paketli kaynaklara (örn. gömülü embedding modeli) erişim.
@@ -62,6 +48,76 @@ def resource_path(relative: str) -> str:
     return os.path.join(base, relative)
 
 
+def enable_hf_offline_if_available(model_name: str) -> None:
+    """
+    Embedding modeli lokalde (projedeki 'models/' klasöründe veya Hugging Face
+    cache'inde) zaten mevcutsa, Hugging Face'i TAMAMEN çevrimdışı moda alır.
+    Böylece model yüklenirken internete (Hub) hiç gidilmez.
+
+    Önemli: Model HENÜZ indirilmemişse offline'a ALINMAZ; ilk çalıştırmada
+    internetten indirilebilsin.
+
+    KRİTİK: Bu fonksiyon huggingface_hub'ı import ETMEZ ve ağır importlardan
+    ÖNCE çağrılır. Çünkü huggingface_hub import anında HF_HUB_OFFLINE'ı okuyup
+    sabitler; import'tan sonra set etmek etkisiz kalır.
+    """
+    def _go_offline(reason: str) -> None:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        logger.info("Hugging Face çevrimdışı moda alındı (%s).", reason)
+
+    # 1) Projeye gömülü 'models/<isim>' klasörü var mı?
+    safe_name = model_name.replace("/", "_")
+    if os.path.isdir(resource_path(os.path.join("models", safe_name))):
+        _go_offline("gömülü model")
+        return
+
+    # 2) Hugging Face cache'inde indirilmiş mi? (HF import etmeden yolu hesapla)
+    hub_cache = os.environ.get("HF_HUB_CACHE")
+    hf_home = os.environ.get("HF_HOME")
+    if hub_cache:
+        base = hub_cache
+    elif hf_home:
+        base = os.path.join(hf_home, "hub")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+
+    repo_dir = "models--" + model_name.replace("/", "--")
+    snapshots = os.path.join(base, repo_dir, "snapshots")
+    try:
+        if os.path.isdir(snapshots) and os.listdir(snapshots):
+            _go_offline("cache'te mevcut")
+    except OSError as exc:
+        logger.debug("HF cache kontrolü atlandı: %s", exc)
+
+
+# KRİTİK SIRA: Ağır kütüphaneler import EDİLMEDEN ÖNCE çevrimdışı modu ayarla.
+# (document_processor -> langchain -> huggingface_hub zinciri HF'i import eder.)
+enable_hf_offline_if_available(EMBEDDING_MODEL)
+
+# --- Ağır importlar (çevrimdışı mod ayarlandıktan SONRA) ---
+from tkinter import filedialog, messagebox  # noqa: E402
+
+import customtkinter as ctk  # noqa: E402
+
+from ui_components import Sidebar, ChatArea  # noqa: E402
+from document_processor import DocumentProcessor  # noqa: E402
+from embedding_manager import EmbeddingManager  # noqa: E402
+from llm_connector import LLMConnector  # noqa: E402
+
+# Sürükle-bırak (opsiyonel). Kütüphane yoksa özellik sessizce devre dışı kalır;
+# dosya/klasör seçme butonları her durumda çalışmaya devam eder.
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES  # noqa: E402
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+#  Yol Yardımcıları (PyInstaller uyumlu)
+# ---------------------------------------------------------------------------
 def writable_data_dir() -> str:
     """
     Yazılabilir kalıcı veri klasörü (vektör veritabanı için).
@@ -108,42 +164,6 @@ def local_embedding_model_path(model_name: str) -> str:
     return model_name
 
 
-def enable_hf_offline_if_available(model_name: str) -> None:
-    """
-    Embedding modeli lokalde (projedeki 'models/' klasöründe veya Hugging Face
-    cache'inde) zaten mevcutsa, Hugging Face'i TAMAMEN çevrimdışı moda alır.
-
-    Neden: huggingface_hub 1.x sürümü, model lokalde olsa bile yüklerken Hub'a
-    (internete) bağlanıp güncelleme kontrolü yapmaya çalışır ve yeni httpx
-    istemcisi bazen 'Cannot send a request, as the client has been closed'
-    hatası verir. Çevrimdışı moda alınca Hub'a hiç gidilmez; bu hem hatayı
-    önler hem de gemideki internetsiz kullanım için zaten doğru davranıştır.
-
-    Önemli: Model HENÜZ indirilmemişse offline'a ALINMAZ; böylece ilk
-    çalıştırmada internetten indirilebilir.
-    """
-    # 1) Projeye gömülü 'models/<isim>' klasörü var mı?
-    safe_name = model_name.replace("/", "_")
-    if os.path.isdir(resource_path(os.path.join("models", safe_name))):
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        logger.info("Embedding modeli gömülü; Hugging Face çevrimdışı moda alındı.")
-        return
-
-    # 2) Hugging Face cache'inde indirilmiş mi?
-    try:
-        from huggingface_hub import constants  # type: ignore
-
-        repo_dir = "models--" + model_name.replace("/", "--")
-        snapshots = os.path.join(constants.HF_HUB_CACHE, repo_dir, "snapshots")
-        if os.path.isdir(snapshots) and os.listdir(snapshots):
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            logger.info("Embedding modeli cache'te; Hugging Face çevrimdışı moda alındı.")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("HF cache kontrolü atlandı: %s", exc)
-
-
 # ---------------------------------------------------------------------------
 #  Ana Uygulama
 # ---------------------------------------------------------------------------
@@ -169,10 +189,7 @@ class GemiAsistaniApp(*_APP_BASES):
         self.geometry("1100x720")
         self.minsize(900, 600)
 
-        # Model lokalde mevcutsa Hugging Face'i çevrimdışı moda al (model
-        # yüklemeden ÖNCE ayarlanmalı; httpx 'client closed' hatasını önler).
-        enable_hf_offline_if_available(self.EMBEDDING_MODEL)
-
+        # (Çevrimdışı mod, modül yüklenirken ağır importlardan önce ayarlandı.)
         # --- İş modüllerini hazırla (modeller lazy yüklenir) ---
         self.processor = DocumentProcessor(chunk_size=1000, chunk_overlap=200)
         self.embedder = EmbeddingManager(
@@ -386,7 +403,7 @@ class GemiAsistaniApp(*_APP_BASES):
                 # Zaten yüklüyse (veya aynı seçimde mükerrer geldiyse) atla.
                 if name in existing:
                     skipped += 1
-                    messages.append(f"• {name}: zaten yüklü, atlandı")
+                    messages.append(f"[ATLANDI] {name}: zaten yüklü")
                     self._post_ui(
                         lambda n=name, i=index: self.sidebar.set_status(
                             f"Atlanıyor ({i}/{total}): {n} (zaten yüklü)", "orange"
@@ -404,9 +421,9 @@ class GemiAsistaniApp(*_APP_BASES):
                     total_chunks += added
                     # Bu oturumda işlendi; aynı ad tekrar gelirse bir daha ekleme.
                     existing.add(name)
-                    messages.append(f"✓ {result.message}")
+                    messages.append(f"[OK] {result.message}")
                 else:
-                    messages.append(f"✗ {result.message}")
+                    messages.append(f"[HATA] {result.message}")
             return total_chunks, skipped, messages
 
         def done(result, error):
@@ -514,7 +531,7 @@ class GemiAsistaniApp(*_APP_BASES):
 
         # 2) Kullanıcı mesajını göster ve "Yazıyor..." balonu ekle.
         self.chat.add_message("Siz", question, is_user=True)
-        thinking_label = self.chat.add_message("Asistan", "⏳ Düşünüyor...", is_user=False)
+        thinking_label = self.chat.add_message("Asistan", "Düşünüyor...", is_user=False)
 
         self._set_busy(True, "Cevap üretiliyor...")
 
@@ -545,12 +562,12 @@ class GemiAsistaniApp(*_APP_BASES):
                 f"Hazır ({self.embedder.get_document_count()} parça)", "lightgreen"
             )
             if error:
-                self.chat.update_message(thinking_label, f"⚠️ Hata: {error}")
+                self.chat.update_message(thinking_label, f"Hata: {error}")
                 return
 
             response, contexts, perf_text = result
             if not response.success:
-                self.chat.update_message(thinking_label, f"⚠️ {response.error}")
+                self.chat.update_message(thinking_label, f"Hata: {response.error}")
                 return
 
             # Kaynak dipnotu ekle.
@@ -560,7 +577,7 @@ class GemiAsistaniApp(*_APP_BASES):
                     f"{c.source}" + (f" (s.{c.page})" if c.page else "")
                     for c in contexts
                 })
-                answer += "\n\n📚 Kaynaklar: " + ", ".join(sources)
+                answer += "\n\nKaynaklar: " + ", ".join(sources)
             # Performans ölçümünü en sona ekle.
             answer += "\n\n" + perf_text
             self.chat.update_message(thinking_label, answer)

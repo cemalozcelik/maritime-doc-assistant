@@ -34,11 +34,11 @@ SYSTEM_PROMPT = (
     "açık ve teknik olarak doğru cevap ver.\n\n"
     "CEVAPLAMA YÖNTEMİ (etiketli hibrit):\n"
     "1. ÖNCE bağlamdaki (dokümanlardaki) bilgiyi kullan. Bu bölümü\n"
-    "   '📄 Dokümandan:' başlığı altında ver ve hangi kaynaktan/sayfadan "
+    "   'DOKÜMANDAN:' başlığı altında ver ve hangi kaynaktan/sayfadan "
     "geldiğini belirt.\n"
     "2. Bağlam soruyu tam karşılamıyorsa, genel gemi mühendisliği bilginle "
     "TAMAMLAYABİLİRSİN; ancak bu bölümü MUTLAKA ayrı olarak\n"
-    "   '💡 Genel mühendislik bilgisi (dokümanda doğrulanmadı):' başlığı altında "
+    "   'GENEL MÜHENDİSLİK BİLGİSİ (dokümanda doğrulanmadı):' başlığı altında "
     "ver. Kullanıcı neyin kaynaklı, neyin genel bilgi olduğunu net görmeli.\n"
     "3. ÇOK ÖNEMLİ: Spesifik sayı, ölçü, basınç/sıcaklık değeri, tork değeri "
     "veya parça numarasını ASLA uydurma. Bu tür bir değer bağlamda yoksa, "
@@ -46,8 +46,13 @@ SYSTEM_PROMPT = (
     "4. Ne bağlamda ne de genel bilginde hiçbir şey yoksa, bunu açıkça söyle.\n"
     "5. Mümkün olduğunda maddeler ve gerekiyorsa adım adım açıkla. "
     "Güvenlikle ilgili konularda dikkatli ve net ol.\n"
-    "Not: Bağlam ilgili bilgi içeriyorsa '📄 Dokümandan' bölümü esas; "
-    "'💡 Genel mühendislik bilgisi' bölümünü yalnızca gerçekten ekleyecek bir "
+    "6. BİÇİM: DÜZ METİN yaz. Markdown işaretlerini (**kalın**, #, ##, ###, "
+    "* madde işareti) ve LaTeX ($...$, \\rightarrow gibi) KULLANMA; çünkü arayüz "
+    "bunları olduğu gibi ham gösterir. Bunun yerine: başlıkları numarayla ve "
+    "büyük harfle yaz (örn. '1) NEDENLER'), alt maddeleri '• ' ile başlat, "
+    "vurgu için tırnak veya BÜYÜK HARF kullan.\n"
+    "Not: Bağlam ilgili bilgi içeriyorsa 'DOKÜMANDAN' bölümü esas; "
+    "'GENEL MÜHENDİSLİK BİLGİSİ' bölümünü yalnızca gerçekten ekleyecek bir "
     "şey varsa kullan."
 )
 
@@ -249,6 +254,7 @@ class OllamaConnector(BaseLLMConnector):
         self.model_name = model_name
         self.host = host.rstrip("/")
         self.timeout = timeout
+        self._details_cache: Optional[dict] = None  # /api/show sonucu (önbellek)
 
     def generate(self, prompt: str) -> LLMResponse:
         try:
@@ -290,7 +296,9 @@ class OllamaConnector(BaseLLMConnector):
             text = "".join(parts).strip()
             if not text:
                 return LLMResponse("", success=False, error="Ollama boş cevap döndürdü.")
-            return LLMResponse(text, meta=self._build_meta(final))
+            meta = self._build_meta(final)
+            meta.update(self._model_details())  # parametre sayısı, quantization
+            return LLMResponse(text, meta=meta)
         except requests.exceptions.ConnectionError:
             return LLMResponse(
                 "",
@@ -308,6 +316,30 @@ class OllamaConnector(BaseLLMConnector):
         except Exception as exc:  # noqa: BLE001
             logger.error("Ollama hatası: %s", exc)
             return LLMResponse("", success=False, error=f"Ollama hatası: {exc}")
+
+    def _model_details(self) -> dict:
+        """
+        Modelin parametre sayısı ve quantization bilgisini /api/show'dan alır
+        (bir kez sorgulanıp önbelleğe alınır). Hata olursa boş döner.
+        """
+        if self._details_cache is not None:
+            return self._details_cache
+        out: dict = {}
+        try:
+            import requests
+            resp = requests.post(
+                f"{self.host}/api/show", json={"name": self.model_name}, timeout=10
+            )
+            resp.raise_for_status()
+            details = (resp.json().get("details") or {})
+            if details.get("parameter_size"):
+                out["parameters"] = details["parameter_size"]
+            if details.get("quantization_level"):
+                out["quantization"] = details["quantization_level"]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Ollama model detayları alınamadı: %s", exc)
+        self._details_cache = out
+        return out
 
     @staticmethod
     def _build_meta(final: dict) -> dict:

@@ -55,7 +55,7 @@ class Sidebar(ctk.CTkFrame):
         # --- Başlık ---
         self.title_label = ctk.CTkLabel(
             self,
-            text="⚓ Gemi Doküman\nAsistanı",
+            text="Gemi Doküman\nAsistanı",
             font=ctk.CTkFont(size=22, weight="bold"),
             justify="center",
         )
@@ -90,7 +90,7 @@ class Sidebar(ctk.CTkFrame):
         # --- Ollama Model Seçimi (Ollama seçilince görünür) ---
         self.ollama_menu = ctk.CTkOptionMenu(self, values=["(model bulunamadı)"])
         self.ollama_refresh_btn = ctk.CTkButton(
-            self, text="🔄 Ollama Modellerini Yenile",
+            self, text="Ollama Modellerini Yenile",
             fg_color="transparent", border_width=1, command=on_refresh_ollama,
         )
 
@@ -101,12 +101,12 @@ class Sidebar(ctk.CTkFrame):
         ).pack(fill="x", padx=20, pady=(20, 2))
 
         self.upload_btn = ctk.CTkButton(
-            self, text="📄 Dosya Yükle", command=on_upload, height=40,
+            self, text="Dosya Yükle", command=on_upload, height=40,
         )
         self.upload_btn.pack(fill="x", padx=20, pady=(0, 6))
 
         self.upload_folder_btn = ctk.CTkButton(
-            self, text="📁 Klasör Yükle", command=on_upload_folder, height=40,
+            self, text="Klasör Yükle", command=on_upload_folder, height=40,
         )
         self.upload_folder_btn.pack(fill="x", padx=20, pady=(0, 6))
 
@@ -114,7 +114,7 @@ class Sidebar(ctk.CTkFrame):
         if dnd_available:
             self.dnd_hint = ctk.CTkLabel(
                 self,
-                text="↪ İpucu: Dosya veya klasörü\npencereye sürükleyip bırakabilirsiniz.",
+                text="İpucu: Dosya veya klasörü\npencereye sürükleyip bırakabilirsiniz.",
                 font=ctk.CTkFont(size=11),
                 text_color="gray60",
                 justify="left",
@@ -122,7 +122,7 @@ class Sidebar(ctk.CTkFrame):
             self.dnd_hint.pack(fill="x", padx=20, pady=(0, 8))
 
         self.clear_btn = ctk.CTkButton(
-            self, text="🗑️ Veritabanını Temizle",
+            self, text="Veritabanını Temizle",
             fg_color="#8a2c2c", hover_color="#a83232", command=on_clear_db,
         )
         self.clear_btn.pack(fill="x", padx=20, pady=(0, 10))
@@ -245,7 +245,7 @@ class ChatArea(ctk.CTkFrame):
         self.entry.bind("<Return>", lambda _event: self._handle_send())
 
         self.send_btn = ctk.CTkButton(
-            input_frame, text="Gönder ➤", width=110, height=45,
+            input_frame, text="Gönder", width=110, height=45,
             command=self._handle_send, font=ctk.CTkFont(size=14, weight="bold"),
         )
         self.send_btn.grid(row=0, column=1)
@@ -293,7 +293,7 @@ class ChatArea(ctk.CTkFrame):
 
         # Mesaj metnini panoya kopyalama butonu.
         copy_btn = ctk.CTkButton(
-            bubble, text="📋 Kopyala", width=90, height=24,
+            bubble, text="Kopyala", width=90, height=24,
             font=ctk.CTkFont(size=11),
             fg_color="transparent", border_width=1, hover_color="#4a4d50",
         )
@@ -316,9 +316,9 @@ class ChatArea(ctk.CTkFrame):
             self.update_idletasks()  # Panoya yazmanın tamamlanmasını garanti et.
         except Exception:  # noqa: BLE001
             return
-        # Kısa görsel geri bildirim: "✓ Kopyalandı" -> 1.5 sn sonra eski metne dön.
+        # Kısa görsel geri bildirim: "Kopyalandı" -> 1.5 sn sonra eski metne dön.
         try:
-            button.configure(text="✓ Kopyalandı")
+            button.configure(text="Kopyalandı")
             self.after(1500, lambda: self._reset_copy_button(button))
         except Exception:  # noqa: BLE001
             pass
@@ -327,7 +327,7 @@ class ChatArea(ctk.CTkFrame):
     def _reset_copy_button(button: ctk.CTkButton) -> None:
         """Kopyala butonunu eski metnine döndürür (widget hâlâ varsa)."""
         try:
-            button.configure(text="📋 Kopyala")
+            button.configure(text="Kopyala")
         except Exception:  # noqa: BLE001
             pass
 
