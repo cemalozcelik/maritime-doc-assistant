@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 import logging
 from abc import ABC, abstractmethod
@@ -50,7 +51,15 @@ def _ensure_llama_loadable() -> None:
 
     candidates: List[str] = []
 
-    # 1) nvidia-cublas-cu12 / nvidia-cuda-runtime-cu12 pip paketleri (tercih edilen).
+    # 0) Paketlenmiş (.exe / PyInstaller) ortamda nvidia DLL'leri _MEIPASS altında
+    #    'nvidia/<paket>/bin' yapısında bulunur; namespace paket import'u frozen'da
+    #    güvenilmez olduğu için yolu doğrudan _MEIPASS'tan kurarız.
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        for sub in ("cuda_runtime", "cublas"):
+            candidates.append(os.path.join(meipass, "nvidia", sub, "bin"))
+
+    # 1) nvidia-cublas-cu12 / nvidia-cuda-runtime-cu12 pip paketleri (geliştirme ortamı).
     try:
         import nvidia  # type: ignore
         nvidia_root = os.path.dirname(nvidia.__file__)

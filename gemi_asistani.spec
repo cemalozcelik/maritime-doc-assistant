@@ -76,14 +76,40 @@ for _p in _sys.path:
         continue
     for _name in _cuda_dlls:
         for _hit in _glob.glob(_os.path.join(_p, "nvidia", "*", "bin", _name)):
-            if _name not in _seen:
-                binaries.append((_hit, "."))
-                _seen.add(_name)
-                print(f"[spec] CUDA DLL eklendi: {_hit}")
+            if _name in _seen:
+                continue
+            # Hedef yolu kaynaktaki 'nvidia/<paket>/bin' yapısıyla AYNI tut; böylece
+            # PyInstaller'ın otomatik topladığı kopyayla çakışıp ÇİFTLENMEZ ve
+            # çalışma zamanı yardımcısı (_ensure_llama_loadable) onu burada bulur.
+            _rel = _hit[_hit.lower().index("nvidia"):]
+            binaries.append((_hit, _os.path.dirname(_rel)))
+            _seen.add(_name)
+            print(f"[spec] CUDA DLL eklendi: {_hit} -> {_os.path.dirname(_rel)}")
 _missing = [d for d in _cuda_dlls if d not in _seen]
 if _missing:
     print(f"[spec] UYARI: CUDA DLL bulunamadi: {_missing} -> LLM GPU calismayabilir. "
           f"Kurulum: pip install nvidia-cublas-cu12==12.1.3.1 nvidia-cuda-runtime-cu12==12.1.105")
+
+# ----------------------------------------------------------------------------
+#  Boyut optimizasyonu: çalışma zamanında GEREKSİZ dosyaları paketten çıkar.
+#  '.lib' (link-time kütüphaneleri, ör. torch/lib/dnnl.lib ~623 MB) ve '.pdb'
+#  (hata ayıklama sembolleri) çalışma anında hiç kullanılmaz. Bunları elemek
+#  .exe boyutunu ~0.7 GB azaltır. Yalnızca kaynak dosya uzantısına bakılır.
+# ----------------------------------------------------------------------------
+def _strip_useless(entries):
+    kept = []
+    dropped = 0
+    for item in entries:
+        src = item[0]
+        if isinstance(src, str) and src.lower().endswith((".lib", ".pdb")):
+            dropped += 1
+            continue
+        kept.append(item)
+    return kept, dropped
+
+binaries, _d1 = _strip_useless(binaries)
+datas, _d2 = _strip_useless(datas)
+print(f"[spec] Gereksiz .lib/.pdb dosyalari cikarildi: {_d1 + _d2} adet")
 
 # ----------------------------------------------------------------------------
 #  İSTEĞE BAĞLI: Embedding modelini .exe içine gömmek isterseniz, modeli
