@@ -61,6 +61,31 @@ if _os.path.isfile("icon.ico"):
     datas += [("icon.ico", ".")]
 
 # ----------------------------------------------------------------------------
+#  CUDA runtime DLL'leri (LLM GPU hızlandırması için).
+#  torch'un CPU sürümü kullanıldığından bu DLL'ler artık 'nvidia-*-cu12' pip
+#  paketlerinden gelir. ggml-cuda.dll bunlara muhtaçtır; onedir modunda aynı
+#  klasöre konduklarında Windows otomatik bulur. Paket boyutunu küçük tutmak
+#  için (torch CUDA ~4.4 GB yerine ~0.6 GB) bu yöntem tercih edilir.
+# ----------------------------------------------------------------------------
+import sys as _sys
+import glob as _glob
+_cuda_dlls = ("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+_seen = set()
+for _p in _sys.path:
+    if not _p or not _os.path.isdir(_p):
+        continue
+    for _name in _cuda_dlls:
+        for _hit in _glob.glob(_os.path.join(_p, "nvidia", "*", "bin", _name)):
+            if _name not in _seen:
+                binaries.append((_hit, "."))
+                _seen.add(_name)
+                print(f"[spec] CUDA DLL eklendi: {_hit}")
+_missing = [d for d in _cuda_dlls if d not in _seen]
+if _missing:
+    print(f"[spec] UYARI: CUDA DLL bulunamadi: {_missing} -> LLM GPU calismayabilir. "
+          f"Kurulum: pip install nvidia-cublas-cu12==12.1.3.1 nvidia-cuda-runtime-cu12==12.1.105")
+
+# ----------------------------------------------------------------------------
 #  İSTEĞE BAĞLI: Embedding modelini .exe içine gömmek isterseniz, modeli
 #  'models/intfloat_multilingual-e5-base' klasörüne indirip aşağıyı açın.
 #  Böylece uygulama internetsiz ilk açılışta bile modeli bulur.

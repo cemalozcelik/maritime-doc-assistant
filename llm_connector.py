@@ -29,10 +29,13 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 # Gömülü motor (llama-cpp-python) CUDA wheel'i, CUDA runtime DLL'lerine (cudart,
-# cublas...) ihtiyaç duyar. Bu DLL'ler torch'un cu1xx dağıtımıyla 'torch/lib'
-# içinde gelir. llama_cpp import edilmeden ÖNCE bu klasörü Windows'un DLL arama
-# yoluna ekleriz; aksi halde 'Could not find module llama.dll (or one of its
-# dependencies)' hatası alınır. CPU wheel'inde bu adım zararsızdır.
+# cublas, cublasLt) ihtiyaç duyar. Paket boyutunu küçültmek için torch'un CPU
+# sürümü kullanılır; bu DLL'ler artık küçük 'nvidia-*-cu12' pip paketlerinden
+# gelir (nvidia/cublas/bin, nvidia/cuda_runtime/bin). llama_cpp import EDİLMEDEN
+# ÖNCE bu klasörler Windows'un DLL arama yoluna eklenir; aksi halde 'Could not
+# find module llama.dll (or one of its dependencies)' hatası alınır. Klasörlerden
+# hiçbiri yoksa (saf CPU llama wheel'i) bu adım zararsızca atlanır. torch'un CUDA
+# sürümü kuruluysa 'torch/lib' de yedek olarak eklenir.
 _LLAMA_DLL_READY = False
 
 
@@ -44,13 +47,49 @@ def _ensure_llama_loadable() -> None:
     _LLAMA_DLL_READY = True
     if os.name != "nt":
         return
+
+    candidates: List[str] = []
+
+    # 1) nvidia-cublas-cu12 / nvidia-cuda-runtime-cu12 pip paketleri (tercih edilen).
     try:
-        import torch  # torch zaten embedding için kurulu.
-        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-        if os.path.isdir(torch_lib):
-            os.add_dll_directory(torch_lib)
+        import nvidia  # type: ignore
+        nvidia_root = os.path.dirname(nvidia.__file__)
+        for sub in ("cuda_runtime", "cublas"):
+            candidates.append(os.path.join(nvidia_root, sub, "bin"))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("nvidia-* DLL paketleri bulunamadı: %s", exc)
+
+    # 2) torch CUDA sürümü kuruluysa 'torch/lib' (yedek).
+    try:
+        import torch
+        candidates.append(os.path.join(os.path.dirname(torch.__file__), "lib"))
     except Exception as exc:  # noqa: BLE001
         logger.debug("torch/lib DLL yolu eklenemedi: %s", exc)
+
+    dirs = [p for p in candidates if os.path.isdir(p)]
+    for path in dirs:
+        try:
+            os.add_dll_directory(path)
+        except OSError as exc:
+            logger.debug("DLL yolu eklenemedi (%s): %s", path, exc)
+
+    # ggml-cuda.dll'in muhtaç olduğu CUDA runtime DLL'lerini AÇIKÇA önceden yükle.
+    # Yalnızca klasörü arama yoluna eklemek bazı ortamlarda yetmiyor; torch'un
+    # CUDA sürümü 'import torch' ile bunları zaten belleğe alıyordu. CPU torch'ta
+    # bu adımı kendimiz yaparız. Sıra önemli: cublas, cublasLt'ye bağımlıdır.
+    if dirs:
+        import ctypes
+        for dll in ("cudart64_12.dll", "cublasLt64_12.dll", "cublas64_12.dll"):
+            for path in dirs:
+                full = os.path.join(path, dll)
+                if os.path.isfile(full):
+                    try:
+                        ctypes.WinDLL(full)
+                    except OSError as exc:
+                        logger.debug("CUDA DLL önyüklenemedi (%s): %s", dll, exc)
+                    break
+    else:
+        logger.debug("CUDA DLL yolu bulunamadı; CPU llama wheel'i varsayılıyor.")
 
 # Gemicilik bağlamına özel sistem yönergesi (system prompt).
 SYSTEM_PROMPT = (
