@@ -327,7 +327,8 @@ def format_ingestion_report(stats: Dict[str, Any]) -> str:
         f"  Gercek OCR calisan    : {g('ocr_executed_pages')}  (cache haric)",
         f"  Onbellek (cache) hit  : {g('cache_hit_pages')}",
         f"  OCR atlanan sayfa     : {g('ocr_skipped_pages')}",
-        f"  Cizim atlanan sayfa   : {g('drawing_skipped_pages')}",
+        f"  Cizim atlanan (ad)    : {g('drawing_skipped_pages')}",
+        f"  Gomulu cizim (dusuk metin): {g('embedded_drawing_pages')}",
         f"  Fallback yapilan sayfa: {g('fallback_pages')}",
         f"  Toplam OCR cagrisi    : {g('total_ocr_calls')}",
         f"  Toplam chunk          : {g('total_chunks')}",
@@ -398,6 +399,11 @@ class DocumentProcessor:
     # Dominant rotasyon tespiti yalnızca OCR gereken sayfa sayısı bu eşiği
     # aşarsa yapılır (az sayfalı dosyada probe maliyeti anlamsız).
     DOMINANT_MIN_PAGES = 8
+
+    # OCR sonrası (en iyi açıda bile) anlamlı metin bu eşiğin altındaysa sayfa
+    # "manuel içine gömülü çizim/şema" sayılır: Chroma'ya EKLENMEZ, drawings_index'e
+    # yazılır. Düşük tutulur ki seyrek-metinli gerçek sayfalar elenmesin.
+    EMBEDDED_DRAWING_MIN_SCORE = 12
 
     # Belge-geneli dominant rotasyon tespiti: ilk bu kadar GÜVENİLİR metinli sayfa
     # tüm açılarda taranır; sonra dominant açı belirlenir.
@@ -580,7 +586,8 @@ class DocumentProcessor:
         st = {
             "source": source, "total_pages": 0, "text_layer_pages": 0,
             "ocr_required_pages": 0, "ocr_used_pages": 0, "ocr_executed_pages": 0,
-            "ocr_skipped_pages": 0, "drawing_skipped_pages": 0, "cache_hit_pages": 0,
+            "ocr_skipped_pages": 0, "drawing_skipped_pages": 0,
+            "embedded_drawing_pages": 0, "cache_hit_pages": 0,
             "failed_pages": [], "total_chunks": 0, "total_chars": 0,
             "text_time": 0.0, "ocr_time": 0.0, "total_ocr_calls": 0,
             "fallback_pages": 0, "dominant_rotation": None, "is_drawing": is_drawing,
@@ -606,6 +613,8 @@ class DocumentProcessor:
 
         probe_rotations: List[int] = []
         dominant_rotation: Optional[int] = None
+        probe_attempts = 0        # dominant kurmak için yapılan tam-arama sayısı
+        give_up_rotation = False  # dominant kurulamadı -> rotasyon aramasını bırak
         try:
             for page_number in range(total_pages):
                 page = document[page_number]
@@ -673,11 +682,23 @@ class DocumentProcessor:
                                     "Dokuman dominant rotasyonu (cache): %d derece (problar: %s)",
                                     dominant_rotation, probe_rotations)
                     else:
+                        # Rotasyon stratejisi:
+                        #  * dominant kuruldu -> sadece dominant açı (fallback yok):
+                        #    çizim sayfaları boşuna 4x taranmaz.
+                        #  * dominant kurulamadı (give_up) -> sadece 0 derece.
+                        #  * hâlâ probe -> tam arama (dominant bulmak için).
+                        if use_dominant and dominant_rotation is not None:
+                            pref, allow_fb = dominant_rotation, False
+                        elif use_dominant and give_up_rotation:
+                            pref, allow_fb = 0, False
+                        else:
+                            pref, allow_fb = (None if not use_dominant else dominant_rotation), True
+
                         t0 = time.perf_counter()
                         rendered = self._render_page_array(page)
                         best = self._ocr_image_best(
                             rendered, f"page_{page_label:03d}",
-                            preferred=dominant_rotation if use_dominant else None)
+                            preferred=pref, allow_fallback=allow_fb)
                         st["ocr_time"] += time.perf_counter() - t0
                         page_text = clean_ocr_text(best["text"])
                         rotation = best["rotation"]
@@ -691,7 +712,7 @@ class DocumentProcessor:
                             "page=%d best_rotation=%d text_len=%d score=%.0f%s",
                             page_label, rotation, len(page_text), best["score"],
                             " (dominant)" if (use_dominant and dominant_rotation is not None)
-                            else " (probe)",
+                            else (" (give-up)" if give_up_rotation else " (probe)"),
                         )
                         # Önbelleğe yaz (force_reocr olsa da güncelle).
                         if self._cache:
@@ -701,16 +722,39 @@ class DocumentProcessor:
                             self._cache.put(file_hash, ck,
                                             {"text": page_text, "rotation": rotation})
                         # Dominant rotasyon tespiti (güvenilir metinli sayfalarla).
-                        if (use_dominant and dominant_rotation is None
-                                and meaningful_score(best["text"]) >= self.ROT_PREFERRED_MIN):
-                            probe_rotations.append(rotation)
-                            if (len(probe_rotations) >= self.ROT_PROBE_PAGES
-                                    or self._rotation_decided(probe_rotations, self.ROT_PROBE_MIN)):
-                                dominant_rotation = Counter(probe_rotations).most_common(1)[0][0]
-                                st["dominant_rotation"] = dominant_rotation
+                        if use_dominant and dominant_rotation is None and not give_up_rotation:
+                            probe_attempts += 1
+                            if meaningful_score(best["text"]) >= self.ROT_PREFERRED_MIN:
+                                probe_rotations.append(rotation)
+                                if (len(probe_rotations) >= self.ROT_PROBE_PAGES
+                                        or self._rotation_decided(probe_rotations, self.ROT_PROBE_MIN)):
+                                    dominant_rotation = Counter(probe_rotations).most_common(1)[0][0]
+                                    st["dominant_rotation"] = dominant_rotation
+                                    logger.info(
+                                        "Dokuman dominant rotasyonu: %d derece (problar: %s)",
+                                        dominant_rotation, probe_rotations)
+                            # Yeterince denedik ama dominant kurulamadı: okunur metin
+                            # yok -> kalan sayfalarda rotasyon aramasını bırak (hız).
+                            if dominant_rotation is None and probe_attempts >= self.ROT_PROBE_PAGES:
+                                give_up_rotation = True
                                 logger.info(
-                                    "Dokuman dominant rotasyonu: %d derece (problar: %s)",
-                                    dominant_rotation, probe_rotations)
+                                    "Dominant kurulamadi (%d denemede okunur metin yok); "
+                                    "kalan sayfalarda rotasyon aramasi durduruldu (%s).",
+                                    probe_attempts, source)
+
+                # OCR'lı bir sayfa en iyi açıda bile anlamlı metin veremiyorsa
+                # "manuel içine gömülü çizim" say: Chroma'ya ekleme, index'e yaz.
+                # (Metin katmanlı sayfalar bu kurala tabi değildir; korunur.)
+                if (ocr_used and meaningful_score(page_text) < self.EMBEDDED_DRAWING_MIN_SCORE):
+                    # Gömülü çizim/şema: "başarısız" değil, beklenen bir durum.
+                    st["embedded_drawing_pages"] += 1
+                    self._append_drawings_index({
+                        "source_file": source, "page": page_label,
+                        "page_type": "embedded_drawing", "ocr_skipped": False,
+                        "reason": "low_text_after_ocr", "image_path": "",
+                    })
+                    self._write_page_debug(page_label, "", rendered)
+                    continue
 
                 # Debug çıktısı (OCR'lı/boş sayfalar için).
                 self._write_page_debug(page_label, page_text, rendered)
@@ -797,14 +841,17 @@ class DocumentProcessor:
         return {"text": text, "rotation": angle, "score": _score_ocr_result(result, text)}
 
     def _ocr_image_best(self, arr, label: str,
-                        preferred: Optional[int] = None) -> Dict[str, Any]:
+                        preferred: Optional[int] = None,
+                        allow_fallback: bool = True) -> Dict[str, Any]:
         """
         Bir görüntüyü OCR eder ve en çok anlamlı metin veren rotasyonu seçer.
 
         * try_rotations kapalıysa yalnızca 0 derece denenir.
         * preferred (dominant açı) verilmişse ÖNCE o denenir; yeterli metin
-          (>= ROT_PREFERRED_MIN) verirse diğer açılar DENENMEZ (hız). Zayıfsa
-          kalan açılara fallback yapılır.
+          (>= ROT_PREFERRED_MIN) verirse diğer açılar DENENMEZ (hız).
+        * allow_fallback False ise (dominant kararlı / give-up) preferred açıda
+          tek tarama yapılır, zayıf olsa bile diğer açılara GİDİLMEZ. Bu, çizim
+          sayfalarının boşuna 4x taranmasını önler.
         * preferred yoksa 0,90,180,270 tam taranır (0 derece bol metin verirse
           erken durulur).
         """
@@ -832,6 +879,9 @@ class DocumentProcessor:
                 # Dominant açı (doğru bilinen) az da olsa ANLAMLI metin verdiyse
                 # güven; sadece neredeyse boş veya saf gürültüyse diğerlerine düş.
                 if preferred is not None and meaningful_score(cur["text"]) >= self.ROT_ACCEPT_MIN:
+                    break
+                # Fallback kapalıysa (dominant kararlı / give-up): tek tarama yeter.
+                if preferred is not None and not allow_fallback:
                     break
         best["calls"] = calls
         # Tercih edilen açı verildiyse ve birden fazla açı denendiyse: fallback oldu.
@@ -866,7 +916,8 @@ class DocumentProcessor:
 
         base = {"source": source, "total_pages": 1, "text_layer_pages": 0,
                 "ocr_required_pages": 1, "ocr_used_pages": 1, "ocr_executed_pages": 1,
-                "ocr_skipped_pages": 0, "drawing_skipped_pages": 0, "cache_hit_pages": 0,
+                "ocr_skipped_pages": 0, "drawing_skipped_pages": 0,
+                "embedded_drawing_pages": 0, "cache_hit_pages": 0,
                 "total_ocr_calls": best.get("calls", 1),
                 "fallback_pages": 1 if best.get("fell_back") else 0,
                 "ocr_time": 0.0, "text_time": 0.0, "dominant_rotation": None}

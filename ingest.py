@@ -57,7 +57,8 @@ def _new_agg() -> dict:
         "source": "TOPLAM", "total_files": 0, "total_pages": 0,
         "text_layer_pages": 0, "ocr_required_pages": 0, "ocr_used_pages": 0,
         "ocr_executed_pages": 0, "ocr_skipped_pages": 0, "drawing_skipped_pages": 0,
-        "cache_hit_pages": 0, "fallback_pages": 0, "total_ocr_calls": 0,
+        "embedded_drawing_pages": 0, "cache_hit_pages": 0, "fallback_pages": 0,
+        "total_ocr_calls": 0,
         "total_chunks": 0, "total_chars": 0, "text_time": 0.0, "ocr_time": 0.0,
         "embedding_time": 0.0, "chroma_time": 0.0, "failed_pages": [],
         "dominant_rotation_files": 0,
@@ -67,8 +68,9 @@ def _new_agg() -> dict:
 def _merge(agg: dict, st: dict, source: str) -> None:
     for key in ("total_pages", "text_layer_pages", "ocr_required_pages",
                 "ocr_used_pages", "ocr_executed_pages", "ocr_skipped_pages",
-                "drawing_skipped_pages", "cache_hit_pages", "fallback_pages",
-                "total_ocr_calls", "total_chunks", "total_chars", "text_time", "ocr_time"):
+                "drawing_skipped_pages", "embedded_drawing_pages", "cache_hit_pages",
+                "fallback_pages", "total_ocr_calls", "total_chunks", "total_chars",
+                "text_time", "ocr_time"):
         agg[key] += st.get(key, 0) or 0
     for fp in (st.get("failed_pages") or []):
         agg["failed_pages"].append(f"{source}:s{fp}")
