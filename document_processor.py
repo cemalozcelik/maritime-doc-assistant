@@ -6,12 +6,18 @@ PDF ve görsel dosyalarını işleyerek metin parçalarına (chunk) dönüştür
 
 Sorumluluklar (Tek Sorumluluk Prensibi - SRP):
     * PDF'lerden metin çıkarma (PyMuPDF / fitz)
-    * Metin içermeyen (taranmış/scanned) PDF sayfalarını görüntüye çevirip OCR ile okuma
+    * Metin içermeyen (taranmış/scanned) PDF sayfalarını yüksek DPI görüntüye
+      çevirip OCR ile okuma (sayfa rotasyonunu otomatik tespit ederek)
     * Görsellerden lokal OCR (EasyOCR) ile metin çıkarma
-    * Çıkarılan metni RecursiveCharacterTextSplitter ile anlamlı parçalara bölme
+    * OCR çıktısını güvenli (sürümden bağımsız) ayrıştırma
+    * Çıkarılan metni temizleyip RecursiveCharacterTextSplitter ile parçalara bölme
 
-Bu modül LLM veya veritabanı hakkında HİÇBİR ŞEY bilmez. Sadece "dosya -> metin parçaları"
-dönüşümünden sorumludur. Bu sayede embedding/LLM katmanlarından bağımsızdır.
+Bu modül LLM veya veritabanı hakkında HİÇBİR ŞEY bilmez. Sadece "dosya -> metin
+parçaları" dönüşümünden sorumludur.
+
+Not: OCR motoru EasyOCR'dır. Aşağıdaki `extract_text_from_ocr_result` yardımcısı,
+hem EasyOCR ((bbox, text, conf) / (bbox, text)) hem de PaddleOCR ([bbox, (text,
+conf)]) çıktı biçimlerini güvenle ayrıştırır; tek bir indeks varsayımına güvenmez.
 """
 
 from __future__ import annotations
@@ -19,9 +25,10 @@ from __future__ import annotations
 import os
 import io
 import re
+import time
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 # PyMuPDF (fitz) -> PDF okuma ve sayfa render etme
 try:
@@ -47,6 +54,159 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# ===========================================================================
+#  OCR Çıktısı Ayrıştırma (sürümden bağımsız, güvenli)
+# ===========================================================================
+def _ocr_item_text(item: Any) -> str:
+    """Tek bir OCR sonucu öğesinden metni güvenle çıkarır (biçim ne olursa olsun)."""
+    if item is None:
+        return ""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for key in ("text", "transcription", "label", "rec_text"):
+            val = item.get(key)
+            if isinstance(val, str):
+                return val
+        return ""
+    if isinstance(item, (list, tuple)):
+        # EasyOCR detail=1: (bbox, text, conf) -> item[1] str
+        if len(item) >= 2 and isinstance(item[1], str):
+            return item[1]
+        # PaddleOCR: [bbox, (text, conf)] -> item[1][0] str
+        if (len(item) >= 2 and isinstance(item[1], (list, tuple))
+                and item[1] and isinstance(item[1][0], str)):
+            return item[1][0]
+        # Genel: ilk düz string elemanı (bbox'lar sayısal olduğu için atlanır)
+        for el in item:
+            if isinstance(el, str):
+                return el
+        # İç içe yapılar için özyinelemeli ara
+        for el in item:
+            txt = _ocr_item_text(el)
+            if txt:
+                return txt
+    return ""
+
+
+def _ocr_item_conf(item: Any) -> Optional[float]:
+    """Bir OCR öğesinden güven (confidence) skorunu çıkarır; yoksa None."""
+    if isinstance(item, (list, tuple)):
+        # EasyOCR: (bbox, text, conf)
+        if len(item) >= 3 and isinstance(item[2], (int, float)):
+            return float(item[2])
+        # PaddleOCR: [bbox, (text, conf)]
+        if (len(item) >= 2 and isinstance(item[1], (list, tuple))
+                and len(item[1]) >= 2 and isinstance(item[1][1], (int, float))):
+            return float(item[1][1])
+    if isinstance(item, dict):
+        for key in ("confidence", "score", "conf"):
+            val = item.get(key)
+            if isinstance(val, (int, float)):
+                return float(val)
+    return None
+
+
+def extract_text_from_ocr_result(result: Any, debug_raw_path: Optional[str] = None) -> str:
+    """
+    OCR sonucundan birleşik metni güvenle çıkarır. Hangi OCR sürümü/biçimi olursa
+    olsun (EasyOCR / PaddleOCR / düz string listesi) çalışır; tek bir indeks
+    varsayımına (line[1][0] vb.) güvenmez.
+
+    Bir Exception oluşursa pipeline ÇÖKMEZ: boş string döner ve (verilmişse)
+    ham sonucu debug dosyasına yazar.
+    """
+    try:
+        if result is None:
+            return ""
+        if isinstance(result, str):
+            return result.strip()
+        lines: List[str] = []
+        for item in result:
+            txt = _ocr_item_text(item)
+            if txt and txt.strip():
+                lines.append(txt.strip())
+        return "\n".join(lines)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("OCR sonucu ayrıştırılamadı (%s); ham çıktı debug'a yazılıyor.", exc)
+        if debug_raw_path:
+            try:
+                os.makedirs(os.path.dirname(debug_raw_path), exist_ok=True)
+                with open(debug_raw_path, "w", encoding="utf-8") as fh:
+                    fh.write(repr(result))
+            except Exception:  # noqa: BLE001
+                pass
+        return ""
+
+
+def _score_ocr_result(result: Any, text: str) -> float:
+    """
+    Bir OCR sonucunu puanlar (rotasyon seçimi için). Güven skorları varsa
+    sum(len(metin) * güven) kullanılır; yoksa toplam metin uzunluğu.
+    Daha yüksek = daha iyi (daha çok güvenilir metin).
+    """
+    try:
+        total = 0.0
+        for item in result or []:
+            txt = _ocr_item_text(item)
+            if not txt:
+                continue
+            conf = _ocr_item_conf(item)
+            total += len(txt) * (conf if conf is not None else 1.0)
+        if total > 0:
+            return total
+    except Exception:  # noqa: BLE001
+        pass
+    return float(len(text or ""))
+
+
+# ===========================================================================
+#  Metin Temizleme (nazik; Türkçe karakter ve sembolleri bozmaz)
+# ===========================================================================
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_INLINE_WS_RE = re.compile(r"[ \t]+")
+_MULTI_NL_RE = re.compile(r"\n{3,}")
+
+
+def clean_ocr_text(text: str) -> str:
+    """
+    OCR metnini NAZİKÇE temizler:
+      * Kontrol karakterlerini boşluğa çevirir.
+      * Satır içi fazla boşlukları teke indirir.
+      * 3+ boş satırı 2'ye indirir, satırları korur.
+    Türkçe karakterleri (ç, ğ, ı, ö, ş, ü), teknik sembolleri ve formülleri SİLMEZ.
+    """
+    if not text:
+        return ""
+    text = _CONTROL_RE.sub(" ", text)
+    lines = [_INLINE_WS_RE.sub(" ", ln).strip() for ln in text.splitlines()]
+    out = "\n".join(lines)
+    out = _MULTI_NL_RE.sub("\n\n", out)
+    return out.strip()
+
+
+# ===========================================================================
+#  İçe Aktarım Raporu
+# ===========================================================================
+def format_ingestion_report(stats: Dict[str, Any]) -> str:
+    """Bir içe aktarım (ingestion) istatistik sözlüğünü okunaklı rapora çevirir."""
+    failed = stats.get("failed_pages") or []
+    lines = [
+        "=== INGESTION RAPORU ===",
+        f"  Kaynak              : {stats.get('source', '-')}",
+        f"  Toplam sayfa        : {stats.get('total_pages', 0)}",
+        f"  Metin cikan sayfa   : {stats.get('pages_with_text', 0)}",
+        f"  OCR kullanilan sayfa: {stats.get('ocr_pages', 0)}",
+        f"  Toplam karakter     : {stats.get('total_chars', 0)}",
+        f"  Toplam chunk        : {stats.get('total_chunks', 0)}",
+        f"  OCR suresi          : {stats.get('ocr_time', 0)} sn",
+        f"  Embedding suresi    : {stats.get('embedding_time', 0)} sn",
+        f"  Chroma yazma suresi : {stats.get('chroma_write_time', 0)} sn",
+        f"  Basarisiz sayfa     : {len(failed)}" + (f" -> {failed}" if failed else ""),
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 #  Veri Modelleri
 # ---------------------------------------------------------------------------
@@ -54,9 +214,12 @@ logger = logging.getLogger(__name__)
 class DocumentChunk:
     """Tek bir metin parçasını ve kaynağına dair üst veriyi (metadata) tutar."""
     text: str
-    source: str           # Kaynak dosya adı
-    page: int = 0         # PDF sayfa numarası (görseller için 0)
-    chunk_index: int = 0  # Parçanın dosya içindeki sıra numarası
+    source: str            # Kaynak dosya adı
+    page: int = 0          # PDF sayfa numarası (görseller için 0)
+    chunk_index: int = 0   # Parçanın dosya içindeki sıra numarası
+    ocr_used: bool = False  # Bu parça OCR ile mi okundu?
+    rotation: int = 0      # Sayfa için seçilen rotasyon (0/90/180/270)
+    char_count: int = 0    # Parçadaki karakter sayısı
 
 
 @dataclass
@@ -65,6 +228,7 @@ class ProcessResult:
     chunks: List[DocumentChunk] = field(default_factory=list)
     success: bool = True
     message: str = ""
+    stats: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -74,27 +238,23 @@ class DocumentProcessor:
     """
     PDF ve görselleri işleyip metin parçaları üreten sınıf.
 
-    OCR motoru (EasyOCR) yüklenmesi pahalı bir işlem olduğu için 'lazy loading'
-    (gerektiğinde yükleme) yöntemiyle yalnızca ilk OCR ihtiyacında başlatılır.
+    OCR motoru (EasyOCR) yüklenmesi pahalı olduğu için 'lazy loading' ile yalnızca
+    ilk OCR ihtiyacında başlatılır. Taranmış sayfalar yüksek DPI'da render edilir,
+    sayfa rotasyonu (0/90/180/270) otomatik denenir ve en çok metin veren açı seçilir.
     """
 
     # OCR uygulanmadan önce PDF'ten en az bu kadar karakter çıkmalı.
     # Daha azı çıkarsa sayfa "taranmış (scanned)" kabul edilip OCR'a yönlendirilir.
     MIN_TEXT_THRESHOLD = 20
 
-    # --- Metin kalite filtresi eşikleri (OCR çöpünü ayıklamak için) ---
-    # Taranmış teknik çizim/diyagramların OCR'ı çoğu zaman anlamsız karakter
-    # çorbası üretir (ör. "MGONTRgE OYSTFGNE", "63620 r 1 ~ C) l\"T1"). Bu tür
-    # parçalar veritabanını kirletip alakasız sonuçların en üste çıkmasına yol
-    # açar. Aşağıdaki ölçütlerden biri bile sağlanmazsa parça "düşük kaliteli"
-    # sayılıp atılır.
-    MIN_CHUNK_CHARS = 15          # Bu uzunluğun altındaki parçalar atılır.
-    MIN_ALPHA_RATIO = 0.50        # Harf / toplam karakter oranı en az.
-    MIN_WORD_RATIO = 0.50         # Kelime-benzeri token / toplam token oranı en az.
-    MIN_WORD_COUNT = 3            # En az bu kadar kelime-benzeri token olmalı.
-    MIN_VOWEL_RATIO = 0.20        # Harfler içinde ünlü oranı en az (gibberish eler).
-    _VOWELS = set("aeiouâîûöüıAEIOUÂÎÛÖÜI")
-    _WORD_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü]{2,}")
+    # Rotasyon denemesinde 0 derece bu kadar metin verdiyse diğer açıları DENEME
+    # (sayfa düzgün/upright; gereksiz 4x OCR'dan kaçınılır).
+    ROT_FASTPATH_CHARS = 240
+
+    # --- Chunk kalite filtresi (GEVŞETİLMİŞ) ---
+    # Eski sürümdeki agresif gibberish filtresi gerçek teknik metni de eliyordu.
+    # Artık yalnızca açıkça çöp olan (neredeyse hiç harf içermeyen) parçalar elenir.
+    MIN_ALPHA_RATIO = 0.15        # Harf oranı bunun altındaysa (saf sembol/rakam) ele.
 
     SUPPORTED_PDF = (".pdf",)
     SUPPORTED_IMAGE = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp")
@@ -106,25 +266,36 @@ class DocumentProcessor:
         ocr_languages: Optional[List[str]] = None,
         enable_pdf_ocr_fallback: bool = True,
         ocr_gpu: Optional[bool] = None,
+        ocr_dpi: int = 300,
+        min_chunk_chars: int = 60,
+        try_rotations: bool = True,
+        debug_dir: Optional[str] = None,
     ) -> None:
         """
         :param chunk_size: Her metin parçasının maksimum karakter uzunluğu.
         :param chunk_overlap: Bağlamı korumak için parçalar arası örtüşme miktarı.
         :param ocr_languages: OCR dilleri (varsayılan: Türkçe + İngilizce).
         :param enable_pdf_ocr_fallback: Metinsiz PDF sayfalarında OCR denensin mi?
-        :param ocr_gpu: OCR için GPU kullanılsın mı? None ise otomatik algılanır
-                        (CUDA'lı torch varsa GPU, yoksa CPU).
+        :param ocr_gpu: OCR için GPU? None ise otomatik (CUDA'lı torch varsa GPU).
+        :param ocr_dpi: Taranmış sayfaların OCR için render DPI'ı (200-300 önerilir).
+        :param min_chunk_chars: Bir parçanın korunması için en az karakter (50-100).
+        :param try_rotations: Taranmış sayfalarda 0/90/180/270 rotasyon denensin mi?
+        :param debug_dir: Verilirse, sayfa başına OCR metni 'debug_ocr/' altına,
+                          boş sayfaların görüntüsü 'debug_failed_pages/' altına yazılır.
         """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.ocr_languages = ocr_languages or ["tr", "en"]
         self.enable_pdf_ocr_fallback = enable_pdf_ocr_fallback
         self._ocr_gpu = ocr_gpu  # None = otomatik
+        self.ocr_dpi = max(72, int(ocr_dpi))
+        self.min_chunk_chars = max(1, int(min_chunk_chars))
+        self.try_rotations = try_rotations
+        self.debug_dir = debug_dir
 
         # OCR motoru ilk kullanımda yüklenecek (lazy).
         self._ocr_reader = None
 
-        # Metin parçalayıcıyı hazırla.
         if RecursiveCharacterTextSplitter is None:
             raise ImportError(
                 "langchain-text-splitters bulunamadı. "
@@ -134,7 +305,6 @@ class DocumentProcessor:
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
-            # Türkçe metinlerde de iyi çalışan ayraç hiyerarşisi:
             separators=["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""],
             length_function=len,
         )
@@ -156,11 +326,8 @@ class DocumentProcessor:
         """EasyOCR okuyucusunu gerektiğinde (ilk OCR ihtiyacında) başlatır."""
         if self._ocr_reader is not None:
             return self._ocr_reader
-
         try:
             import easyocr  # Ağır bir import olduğu için fonksiyon içinde yapılıyor.
-            # GPU'yu otomatik algıla: CUDA'lı torch varsa GPU kullan (taramaları
-            # belirgin hızlandırır), yoksa CPU'ya düş (güvenli varsayılan).
             use_gpu = self._detect_gpu()
             logger.info(
                 "EasyOCR motoru yükleniyor (diller: %s, GPU: %s)...",
@@ -179,10 +346,7 @@ class DocumentProcessor:
     #  Genel Giriş Noktası
     # ------------------------------------------------------------------ #
     def process_file(self, file_path: str) -> ProcessResult:
-        """
-        Dosya uzantısına göre uygun işleyiciye yönlendiren ana metot.
-        UI katmanı yalnızca bu metodu çağırır; iç ayrımları bilmesine gerek yoktur.
-        """
+        """Dosya uzantısına göre uygun işleyiciye yönlendiren ana metot."""
         if not os.path.isfile(file_path):
             return ProcessResult(success=False, message=f"Dosya bulunamadı: {file_path}")
 
@@ -203,10 +367,7 @@ class DocumentProcessor:
             return ProcessResult(success=False, message=f"İşleme hatası: {exc}")
 
     def collect_supported_files(self, folder: str) -> List[str]:
-        """
-        Bir klasörü (ve tüm alt klasörlerini) tarayıp desteklenen
-        (PDF/görsel) dosyaların tam yollarını sıralı biçimde döndürür.
-        """
+        """Bir klasörü (alt klasörler dahil) tarayıp desteklenen dosyaları döndürür."""
         found: List[str] = []
         if not os.path.isdir(folder):
             return found
@@ -222,7 +383,7 @@ class DocumentProcessor:
     #  PDF İşleme
     # ------------------------------------------------------------------ #
     def _process_pdf(self, file_path: str) -> ProcessResult:
-        """PDF'ten metin çıkarır; metinsiz sayfalarda OCR'a düşer."""
+        """PDF'ten metin çıkarır; metinsiz sayfalarda rotasyon-bilinçli OCR'a düşer."""
         if fitz is None:
             return ProcessResult(
                 success=False,
@@ -231,155 +392,252 @@ class DocumentProcessor:
 
         source = os.path.basename(file_path)
         all_chunks: List[DocumentChunk] = []
-        ocr_used_pages = 0
+        ocr_pages = 0
+        pages_with_text = 0
+        total_chars = 0
+        ocr_time = 0.0
+        failed_pages: List[int] = []
 
         try:
             document = fitz.open(file_path)
         except Exception as exc:  # noqa: BLE001
             return ProcessResult(success=False, message=f"PDF açılamadı: {exc}")
 
+        total_pages = len(document)
         try:
-            for page_number in range(len(document)):
+            for page_number in range(total_pages):
                 page = document[page_number]
-                text = (page.get_text() or "").strip()
+                page_label = page_number + 1
+                text_layer = (page.get_text() or "").strip()
 
-                # Sayfada anlamlı metin yoksa ve OCR açıksa -> taranmış sayfa, OCR uygula.
-                if len(text) < self.MIN_TEXT_THRESHOLD and self.enable_pdf_ocr_fallback:
-                    ocr_text = self._ocr_pdf_page(page)
-                    if ocr_text:
-                        text = ocr_text
-                        ocr_used_pages += 1
+                ocr_used = False
+                rotation = 0
+                rendered = None  # OCR'da render edilen numpy görüntü (debug için)
 
-                if not text:
-                    continue  # Tamamen boş sayfayı atla.
-
-                # Sayfa metnini parçalara böl ve metadata ekle.
-                for idx, piece in enumerate(self._split_text(text)):
-                    all_chunks.append(
-                        DocumentChunk(
-                            text=piece,
-                            source=source,
-                            page=page_number + 1,
-                            chunk_index=idx,
-                        )
+                if len(text_layer) >= self.MIN_TEXT_THRESHOLD:
+                    page_text = clean_ocr_text(text_layer)
+                elif self.enable_pdf_ocr_fallback:
+                    t0 = time.perf_counter()
+                    rendered = self._render_page_array(page)
+                    best = self._ocr_image_best(rendered, f"page_{page_label:03d}")
+                    ocr_time += time.perf_counter() - t0
+                    page_text = clean_ocr_text(best["text"])
+                    ocr_used = True
+                    rotation = best["rotation"]
+                    ocr_pages += 1
+                    logger.info(
+                        "page=%d best_rotation=%d text_len=%d score=%.0f",
+                        page_label, rotation, len(page_text), best["score"],
                     )
+                else:
+                    page_text = ""
+
+                # Debug: sayfa metnini yaz (varsa); boşsa görüntüyü kaydet.
+                self._write_page_debug(page_label, page_text, rendered)
+
+                if page_text:
+                    pages_with_text += 1
+                    total_chars += len(page_text)
+                    pieces = self._split_text(page_text)
+                    if not pieces:
+                        # OCR metin üretti ama chunker 0 üretti -> bug. Logla + kurtar.
+                        logger.warning(
+                            "WARNING: OCR produced text but chunker produced 0 chunks "
+                            "(page=%d, chars=%d).", page_label, len(page_text)
+                        )
+                        pieces = [page_text]  # Veriyi kaybetme.
+                    for idx, piece in enumerate(pieces):
+                        all_chunks.append(DocumentChunk(
+                            text=piece, source=source, page=page_label,
+                            chunk_index=idx, ocr_used=ocr_used,
+                            rotation=rotation, char_count=len(piece),
+                        ))
+                else:
+                    failed_pages.append(page_label)
         finally:
             document.close()
 
-        if not all_chunks:
-            return ProcessResult(
-                success=False,
-                message=f"'{source}' içinden okunabilir metin çıkarılamadı.",
+        stats = {
+            "source": source,
+            "total_pages": total_pages,
+            "pages_with_text": pages_with_text,
+            "ocr_pages": ocr_pages,
+            "total_chars": total_chars,
+            "total_chunks": len(all_chunks),
+            "ocr_time": round(ocr_time, 2),
+            "failed_pages": failed_pages,
+        }
+
+        if total_chars > 0 and not all_chunks:
+            # Bu noktaya normalde gelinmez (kurtarma var); yine de açıkça hata say.
+            logger.warning(
+                "WARNING: OCR produced text but chunker produced 0 chunks (%s).", source
             )
 
-        msg = f"'{source}' işlendi: {len(all_chunks)} parça."
-        if ocr_used_pages:
-            msg += f" ({ocr_used_pages} sayfa OCR ile okundu.)"
-        return ProcessResult(chunks=all_chunks, success=True, message=msg)
+        if not all_chunks:
+            if total_chars == 0:
+                msg = (f"'{source}': hiçbir sayfadan metin çıkarılamadı "
+                       f"({len(failed_pages)}/{total_pages} sayfa boş).")
+                if self.debug_dir:
+                    msg += f" Görseller '{self._failed_dir()}' altına kaydedildi."
+            else:
+                msg = f"'{source}': metin çıktı ama parça üretilemedi (chunker hatası)."
+            return ProcessResult(success=False, message=msg, stats=stats)
 
-    def _ocr_pdf_page(self, page) -> str:
-        """Tek bir PDF sayfasını görüntüye çevirip OCR ile metnini okur."""
-        try:
-            # 2x ölçek -> OCR doğruluğunu artırmak için daha yüksek çözünürlük.
-            matrix = fitz.Matrix(2.0, 2.0)
-            pixmap = page.get_pixmap(matrix=matrix)
-            image_bytes = pixmap.tobytes("png")
-            return self._run_ocr_on_bytes(image_bytes)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("PDF sayfası OCR edilemedi: %s", exc)
-            return ""
+        msg = f"'{source}' işlendi: {len(all_chunks)} parça."
+        if ocr_pages:
+            msg += f" ({ocr_pages} sayfa OCR ile okundu.)"
+        if failed_pages:
+            msg += f" {len(failed_pages)} sayfa boş kaldı."
+        return ProcessResult(chunks=all_chunks, success=True, message=msg, stats=stats)
+
+    def _render_page_array(self, page):
+        """PDF sayfasını ocr_dpi çözünürlükte numpy RGB diziye render eder."""
+        import numpy as np
+        zoom = self.ocr_dpi / 72.0
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        if Image is not None:
+            img = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+            return np.array(img)
+        # Pillow yoksa doğrudan pixmap tamponundan diziye çevir.
+        data = np.frombuffer(pixmap.samples, dtype=np.uint8)
+        return data.reshape(pixmap.height, pixmap.width, pixmap.n)
+
+    # ------------------------------------------------------------------ #
+    #  OCR Çekirdeği (rotasyon tespitli)
+    # ------------------------------------------------------------------ #
+    def _ocr_image_best(self, arr, label: str) -> Dict[str, Any]:
+        """
+        Bir görüntüyü 0/90/180/270 derece deneyerek OCR eder ve en çok anlamlı
+        metin veren açının sonucunu döndürür: {text, rotation, score}.
+        0 derece yeterince metin verirse diğer açılar denenmez (hız için).
+        """
+        import numpy as np
+        best: Dict[str, Any] = {"text": "", "rotation": 0, "score": -1.0}
+        angles = [0, 90, 180, 270] if self.try_rotations else [0]
+        reader = self._get_ocr_reader()
+
+        for k, angle in enumerate(angles):
+            rotated = arr if angle == 0 else np.rot90(arr, k)
+            # numpy dizisini OCR'a verirken bellek-bitişik (contiguous) yap.
+            rotated = np.ascontiguousarray(rotated)
+            try:
+                result = reader.readtext(rotated, detail=1, paragraph=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("OCR hata (%s, %d derece): %s", label, angle, exc)
+                continue
+            dbg = None
+            if self.debug_dir:
+                dbg = os.path.join(self._ocr_dir(), f"{label}_rot{angle}_raw.txt")
+            text = extract_text_from_ocr_result(result, debug_raw_path=dbg)
+            score = _score_ocr_result(result, text)
+            if score > best["score"]:
+                best = {"text": text, "rotation": angle, "score": score}
+            # Hızlı yol: 0 derece zaten bol metin verdiyse diğerlerini deneme.
+            if angle == 0 and len(text) >= self.ROT_FASTPATH_CHARS:
+                break
+        return best
 
     # ------------------------------------------------------------------ #
     #  Görsel İşleme (OCR)
     # ------------------------------------------------------------------ #
     def _process_image(self, file_path: str) -> ProcessResult:
-        """Bir görsel dosyasını lokal OCR ile okuyup metin parçaları üretir."""
+        """Bir görsel dosyasını rotasyon-bilinçli OCR ile okuyup parçalar üretir."""
+        import numpy as np
         source = os.path.basename(file_path)
         try:
-            with open(file_path, "rb") as fh:
-                image_bytes = fh.read()
-            text = self._run_ocr_on_bytes(image_bytes).strip()
+            if Image is not None:
+                arr = np.array(Image.open(file_path).convert("RGB"))
+            else:
+                with open(file_path, "rb") as fh:
+                    arr = fh.read()
+            best = self._ocr_image_best(arr, os.path.splitext(source)[0])
+            text = clean_ocr_text(best["text"])
         except Exception as exc:  # noqa: BLE001
             return ProcessResult(success=False, message=f"Görsel OCR hatası: {exc}")
 
         if not text:
             return ProcessResult(
-                success=False,
-                message=f"'{source}' görselinde metin bulunamadı.",
+                success=False, message=f"'{source}' görselinde metin bulunamadı.",
+                stats={"source": source, "total_pages": 1, "pages_with_text": 0,
+                       "ocr_pages": 1, "total_chars": 0, "total_chunks": 0,
+                       "failed_pages": [1]},
             )
 
+        pieces = self._split_text(text) or [text]
         chunks = [
-            DocumentChunk(text=piece, source=source, page=0, chunk_index=idx)
-            for idx, piece in enumerate(self._split_text(text))
+            DocumentChunk(text=piece, source=source, page=0, chunk_index=idx,
+                          ocr_used=True, rotation=best["rotation"], char_count=len(piece))
+            for idx, piece in enumerate(pieces)
         ]
+        stats = {"source": source, "total_pages": 1, "pages_with_text": 1,
+                 "ocr_pages": 1, "total_chars": len(text), "total_chunks": len(chunks),
+                 "failed_pages": []}
         return ProcessResult(
-            chunks=chunks,
-            success=True,
-            message=f"'{source}' OCR ile okundu: {len(chunks)} parça.",
+            chunks=chunks, success=True,
+            message=f"'{source}' OCR ile okundu: {len(chunks)} parça.", stats=stats,
         )
 
-    def _run_ocr_on_bytes(self, image_bytes: bytes) -> str:
-        """Ham görsel byte verisi üzerinde EasyOCR çalıştırır ve birleşik metin döner."""
-        reader = self._get_ocr_reader()
-
-        # EasyOCR numpy array veya bytes kabul eder; Pillow ile normalize ediyoruz.
-        if Image is not None:
-            try:
-                import numpy as np
-                pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                ocr_input = np.array(pil_image)
-            except Exception:  # noqa: BLE001
-                ocr_input = image_bytes  # Pillow başarısız olursa ham byte ile dene.
-        else:
-            ocr_input = image_bytes
-
-        # detail=0 -> sadece metin listesi döner (koordinat/skor olmadan).
-        results = reader.readtext(ocr_input, detail=0, paragraph=True)
-        return "\n".join(results)
-
     # ------------------------------------------------------------------ #
-    #  Metin Parçalama
+    #  Metin Parçalama (GEVŞETİLMİŞ filtre)
     # ------------------------------------------------------------------ #
     def _split_text(self, text: str) -> List[str]:
         """
-        Uzun metni, bağlamı koruyan örtüşmeli parçalara böler ve düşük kaliteli
-        (OCR çöpü) parçaları ayıklar.
+        Sayfa metnini örtüşmeli parçalara böler ve YALNIZCA açıkça çöp olan
+        (neredeyse hiç harf içermeyen) parçaları eler. Çok kısa satırlar tek tek
+        atılmaz; metin önce birleşik haldedir, sonra chunk'lanır. Filtre tüm
+        parçaları elerse veri kaybını önlemek için en az birkaç harf içeren
+        parçalar (gerekirse ham parçalar) korunur.
         """
-        if not text:
+        if not text or not text.strip():
             return []
-        pieces = (chunk.strip() for chunk in self._splitter.split_text(text))
-        return [p for p in pieces if p and not self._is_low_quality(p)]
+        raw = [c.strip() for c in self._splitter.split_text(text)]
+        raw = [c for c in raw if c]
+        kept = [c for c in raw if not self._is_garbage(c)]
+        if not kept and raw:
+            # Filtre her şeyi eledi: en az 3 harf içerenleri kurtar, o da yoksa ham.
+            kept = [c for c in raw if sum(ch.isalpha() for ch in c) >= 3] or raw
+        return kept
 
-    def _is_low_quality(self, text: str) -> bool:
+    def _is_garbage(self, text: str) -> bool:
         """
-        Bir metin parçasının anlamsız OCR çöpü olup olmadığını sezgisel olarak
-        değerlendirir. Gerçek (TR/EN) cümleleri korur; taranmış çizimlerden çıkan
-        karakter çorbasını eler. Sözlük/kütüphane gerektirmez (tamamen lokal).
+        Sadece AÇIKÇA çöp parçaları eler (eski agresif filtre kaldırıldı).
+        Çöp = çok kısa, ya da neredeyse hiç harf içermeyen (saf sembol/rakam).
         """
         t = text.strip()
-        if len(t) < self.MIN_CHUNK_CHARS:
+        if len(t) < self.min_chunk_chars:
             return True
-
         letters = sum(1 for c in t if c.isalpha())
         if letters == 0:
             return True
-
-        # 1) Harf oranı: çoğunluk sembol/rakamsa muhtemelen çizim/tablo çöpü.
         if letters / len(t) < self.MIN_ALPHA_RATIO:
             return True
-
-        tokens = t.split()
-        words = self._WORD_RE.findall(t)
-        # 2) Token'ların çoğu kelime-benzeri değilse (kopuk semboller) ele.
-        if not tokens or len(words) / len(tokens) < self.MIN_WORD_RATIO:
-            return True
-        # 3) Anlamlı olabilmesi için en az birkaç gerçek kelime olmalı.
-        if len(words) < self.MIN_WORD_COUNT:
-            return True
-
-        # 4) Ünlü oranı çok düşükse (ör. "MGONTRG ZXCV") gibberish kabul et.
-        vowels = sum(1 for c in t if c in self._VOWELS)
-        if vowels / letters < self.MIN_VOWEL_RATIO:
-            return True
-
         return False
+
+    # ------------------------------------------------------------------ #
+    #  Debug Çıktısı
+    # ------------------------------------------------------------------ #
+    def _ocr_dir(self) -> str:
+        return os.path.join(self.debug_dir, "debug_ocr")
+
+    def _failed_dir(self) -> str:
+        return os.path.join(self.debug_dir, "debug_failed_pages")
+
+    def _write_page_debug(self, page_label: int, page_text: str, rendered) -> None:
+        """debug_dir verilmişse: sayfa metnini txt'ye, boş sayfayı png'ye yazar."""
+        if not self.debug_dir:
+            return
+        try:
+            ocr_dir = self._ocr_dir()
+            os.makedirs(ocr_dir, exist_ok=True)
+            with open(os.path.join(ocr_dir, f"page_{page_label:03d}.txt"),
+                      "w", encoding="utf-8") as fh:
+                fh.write(page_text or "")
+            if not page_text and rendered is not None and Image is not None:
+                failed_dir = self._failed_dir()
+                os.makedirs(failed_dir, exist_ok=True)
+                Image.fromarray(rendered).save(
+                    os.path.join(failed_dir, f"page_{page_label:03d}.png")
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Debug çıktısı yazılamadı (page=%d): %s", page_label, exc)

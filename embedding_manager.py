@@ -160,6 +160,10 @@ class EmbeddingManager:
         # Birden fazla thread'in aynı anda koleksiyon oluşturmasını engeller.
         self._init_lock = threading.Lock()
 
+        # Son add_chunks çağrısının süre ölçümleri (ingestion raporu için).
+        self.last_embedding_time = 0.0
+        self.last_chroma_write_time = 0.0
+
     # ------------------------------------------------------------------ #
     #  Veritabanı Bağlantısı (Lazy + Thread-safe)
     # ------------------------------------------------------------------ #
@@ -235,15 +239,24 @@ class EmbeddingManager:
 
         for chunk in chunks:
             documents.append(chunk.text)
+            source = getattr(chunk, "source", "bilinmiyor")
             metadatas.append(
                 {
-                    "source": getattr(chunk, "source", "bilinmiyor"),
+                    # 'source' geriye dönük uyumluluk (retrieval bunu okur);
+                    # 'source_file' yeni, açık adlandırma (ikisi aynı değer).
+                    "source": source,
+                    "source_file": source,
                     "page": int(getattr(chunk, "page", 0)),
                     "chunk_index": int(getattr(chunk, "chunk_index", 0)),
+                    "ocr_used": bool(getattr(chunk, "ocr_used", False)),
+                    "rotation": int(getattr(chunk, "rotation", 0)),
+                    "char_count": int(getattr(chunk, "char_count", 0) or len(chunk.text)),
                 }
             )
             ids.append(str(uuid.uuid4()))
 
+        embedding_time = 0.0
+        write_time = 0.0
         try:
             # Büyük dosyalarda belleği korumak için partiler halinde ekle.
             batch_size = 64
@@ -251,13 +264,20 @@ class EmbeddingManager:
                 end = start + batch_size
                 batch_docs = documents[start:end]
                 # Vektörleri biz hesaplıyoruz (ChromaDB'nin EF mekanizmasını kullanmadan).
+                t0 = time.perf_counter()
                 batch_embeddings = self._embedder.embed_documents(batch_docs)
+                t1 = time.perf_counter()
                 collection.add(
                     documents=batch_docs,
                     embeddings=batch_embeddings,
                     metadatas=metadatas[start:end],
                     ids=ids[start:end],
                 )
+                t2 = time.perf_counter()
+                embedding_time += t1 - t0
+                write_time += t2 - t1
+            self.last_embedding_time = round(embedding_time, 2)
+            self.last_chroma_write_time = round(write_time, 2)
             logger.info("%d parça veritabanına eklendi.", len(documents))
             return len(documents)
         except Exception as exc:  # noqa: BLE001

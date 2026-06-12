@@ -105,7 +105,7 @@ import customtkinter as ctk  # noqa: E402
 from ui_components import (  # noqa: E402
     ChatHistoryRail, ChatArea, ModelsView, DownloadsView, SettingsView,
 )
-from document_processor import DocumentProcessor  # noqa: E402
+from document_processor import DocumentProcessor, format_ingestion_report  # noqa: E402
 from embedding_manager import EmbeddingManager  # noqa: E402
 from llm_connector import LLMConnector  # noqa: E402
 from model_manager import ModelManager  # noqa: E402
@@ -662,6 +662,11 @@ class GemiAsistaniApp(*_APP_BASES):
             total_chunks = 0
             skipped = 0
             messages = []
+            # Tüm dosyalar için toplulaştırılmış içe aktarım istatistikleri.
+            agg = {"source": f"{total} dosya", "total_pages": 0, "pages_with_text": 0,
+                   "ocr_pages": 0, "total_chars": 0, "total_chunks": 0,
+                   "ocr_time": 0.0, "embedding_time": 0.0, "chroma_write_time": 0.0,
+                   "failed_pages": []}
             existing = set(self.embedder.list_sources())
             for index, path in enumerate(paths, start=1):
                 name = os.path.basename(path)
@@ -680,14 +685,27 @@ class GemiAsistaniApp(*_APP_BASES):
                     )
                 )
                 result = self.processor.process_file(path)
+                st = result.stats or {}
+                agg["total_pages"] += st.get("total_pages", 0)
+                agg["pages_with_text"] += st.get("pages_with_text", 0)
+                agg["ocr_pages"] += st.get("ocr_pages", 0)
+                agg["total_chars"] += st.get("total_chars", 0)
+                agg["ocr_time"] += st.get("ocr_time", 0) or 0
+                for fp in (st.get("failed_pages") or []):
+                    agg["failed_pages"].append(f"{name}:s{fp}")
                 if result.success and result.chunks:
                     added = self.embedder.add_chunks(result.chunks)
                     total_chunks += added
+                    agg["embedding_time"] += self.embedder.last_embedding_time
+                    agg["chroma_write_time"] += self.embedder.last_chroma_write_time
                     existing.add(name)
                     messages.append(f"[OK] {result.message}")
                 else:
                     messages.append(f"[HATA] {result.message}")
-            return total_chunks, skipped, messages
+            agg["total_chunks"] = total_chunks
+            for key in ("ocr_time", "embedding_time", "chroma_write_time"):
+                agg[key] = round(agg[key], 2)
+            return total_chunks, skipped, messages, agg
 
         def done(result, error):
             self._set_busy(False)
@@ -695,7 +713,7 @@ class GemiAsistaniApp(*_APP_BASES):
                 self.rail.set_status("İşleme hatası!", "red")
                 messagebox.showerror("Hata", f"Doküman işlenirken hata oluştu:\n{error}")
                 return
-            _total_chunks, skipped, messages = result
+            _total_chunks, skipped, messages, agg = result
             self.settings_view.set_documents(self.embedder.list_sources())
             count = self.embedder.get_document_count()
             self.rail.set_status(f"Hazır ({count} parça)", "lightgreen")
@@ -706,7 +724,10 @@ class GemiAsistaniApp(*_APP_BASES):
             ozet = "Yükleme tamamlandı"
             if skipped:
                 ozet += f" ({skipped} dosya zaten yüklüydü, atlandı)"
-            self.chat.add_message("Sistem", ozet + ":\n" + "\n".join(shown), is_user=False)
+            body = ozet + ":\n" + "\n".join(shown)
+            if agg.get("total_pages"):
+                body += "\n\n" + format_ingestion_report(agg)
+            self.chat.add_message("Sistem", body, is_user=False)
 
         self._run_in_background(task, on_done=done)
 

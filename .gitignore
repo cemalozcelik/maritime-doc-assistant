@@ -27,6 +27,10 @@ dist/
 # Inno Setup kurulum çıktısı
 installer_output/
 
+# OCR tanılama (debug) çıktıları
+debug_ocr/
+debug_failed_pages/
+
 # IDE / editör
 .vscode/
 .idea/
