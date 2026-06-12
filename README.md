@@ -29,14 +29,16 @@ seçildiğinde gereklidir.
   gemini-2.5-pro), yokken gömülü yerel motor (llama.cpp / GGUF). Arayüzden tek tıkla
   geçiş. Gemini bağlantısı güncel google-genai SDK'sı ile kurulur. Çevrimdışı motor
   için harici bir program (Ollama vb.) GEREKMEZ; tamamen uygulamaya gömülüdür.
-- Arayüzden model indirme: "Modeller" sekmesinden önerilen GGUF modelleri (Qwen2.5
+- Arayüzden model indirme: "İndirilenler" sekmesinden önerilen GGUF modelleri (Qwen2.5
   1.5B/3B/7B, Llama 3.1 8B, Gemma 2 9B) tek tıkla, ilerleme çubuğuyla indirilir;
-  terminal veya harici komut gerekmez. İndirilen model aktif seçilip silinebilir.
+  terminal veya harici komut gerekmez. Tüm model kataloğu burada listelenir (başka
+  bilgisayarlara kurulumda kolaylık için). İndirilen model "Modeller" sekmesinden
+  aktif seçilir; silme de "İndirilenler" sekmesinden yapılır.
 - Geçmiş sohbetler (Gemini benzeri): her sohbet diske kaydedilir; uygulama kapanıp
   açıldığında sol panelde listede kalır. Yeni sohbet açma, geçmişe tıklayıp devam
   etme ve silme desteklenir.
-- Gemini benzeri arayüz: solda geçmiş sohbet rayı ve Sohbet / Modeller / Ayarlar
-  gezinmesi; ortada sohbet alanı.
+- Gemini benzeri arayüz: solda geçmiş sohbet rayı ve Sohbet / Modeller / İndirilenler /
+  Ayarlar gezinmesi; ortada sohbet alanı.
 - Etiketli hibrit yanıt: cevap önce yüklenen dokümana dayanır ("DOKÜMANDAN"),
   gerektiğinde genel mühendislik bilgisi ayrı ve açıkça etiketlenerek ("GENEL
   MÜHENDİSLİK BİLGİSİ — dokümanda doğrulanmadı") eklenir. Sayı ve parça numaraları
@@ -73,7 +75,7 @@ sorumluluğu vardır ve diğerlerine sıkı bağlı değildir.
 ```
 maritime-doc-assistant/
 ├── main.py                 Giriş noktası, ana pencere, modül koordinasyonu, thread yönetimi
-├── ui_components.py        Arayüz bileşenleri (sohbet rayı, sohbet alanı, Modeller/Ayarlar)
+├── ui_components.py        Arayüz bileşenleri (sohbet rayı, sohbet alanı, Modeller/İndirilenler/Ayarlar)
 ├── document_processor.py   PDF okuma, metin parçalama, görsel/taranmış PDF OCR
 ├── embedding_manager.py    Lokal embedding, ChromaDB, benzerlik araması (RAG retrieval)
 ├── llm_connector.py        Gemini / gömülü yerel motor bağlantısı ve prompt yönetimi
@@ -124,8 +126,8 @@ pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-c
 ```
 
 İlk çalıştırmada embedding modeli (yaklaşık 1,1 GB) ve ilk OCR işleminde EasyOCR
-modelleri bir kez indirilir. Yerel dil modeli (GGUF) ise "Modeller" sekmesinden bir
-kez indirilir. Bu indirmelerden sonra uygulama tamamen internetsiz çalışır.
+modelleri bir kez indirilir. Yerel dil modeli (GGUF) ise "İndirilenler" sekmesinden
+bir kez indirilir. Bu indirmelerden sonra uygulama tamamen internetsiz çalışır.
 
 ---
 
@@ -133,10 +135,11 @@ kez indirilir. Bu indirmelerden sonra uygulama tamamen internetsiz çalışır.
 
 1. Doküman ekleyin: "Ayarlar" sekmesinden "Dosya Yükle" veya "Klasör Yükle" düğmesini
    kullanın, ya da dosya/klasörü doğrudan pencereye sürükleyip bırakın.
-2. Dil modelini seçin ("Modeller" sekmesi):
-   - Gemini (çevrimiçi): sağlayıcıyı Gemini yapıp API anahtarınızı girin.
-   - Yerel Model (çevrimdışı): bir GGUF model indirin (ör. Qwen2.5 3B), indikten sonra
-     "Aktif yerel model" olarak seçin.
+2. Dil modelini seçin:
+   - Gemini (çevrimiçi): "Modeller" sekmesinde sağlayıcıyı Gemini yapıp API anahtarınızı
+     girin.
+   - Yerel Model (çevrimdışı): "İndirilenler" sekmesinden bir GGUF model indirin
+     (ör. Qwen2.5 7B), ardından "Modeller" sekmesinde "Aktif yerel model" olarak seçin.
 3. Soru sorun: "Sohbet" sekmesindeki metin kutusuna yazıp "Gönder" düğmesine basın.
    Yanıtın altında kullanılan kaynaklar ve performans bloğu listelenir.
 4. Geçmiş sohbetler: sol panelde listelenir; "+ Yeni Sohbet" ile yeni başlatabilir,
@@ -195,7 +198,7 @@ EasyOCR modelleri ilk OCR işleminde `C:\Users\<kullanıcı>\.EasyOCR\model` diz
 iner. Bu dizin hedef bilgisayarda aynı konuma kopyalanmalı veya kod içinde
 `model_storage_directory` parametresiyle yönlendirilmelidir.
 
-Yerel dil modeli (GGUF): "Modeller" sekmesinden indirilen GGUF dosyaları, uygulamanın
+Yerel dil modeli (GGUF): "İndirilenler" sekmesinden indirilen GGUF dosyaları, uygulamanın
 yanındaki `data/models_gguf/` klasörüne yazılır. İnternetin hiç bulunmayacağı bir hedef
 bilgisayar için bu klasörü olduğu gibi kopyalamak yeterlidir; model orada bulunursa
 indirme gerekmez.

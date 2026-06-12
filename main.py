@@ -103,7 +103,7 @@ from tkinter import filedialog, messagebox  # noqa: E402
 import customtkinter as ctk  # noqa: E402
 
 from ui_components import (  # noqa: E402
-    ChatHistoryRail, ChatArea, ModelsView, SettingsView,
+    ChatHistoryRail, ChatArea, ModelsView, DownloadsView, SettingsView,
 )
 from document_processor import DocumentProcessor  # noqa: E402
 from embedding_manager import EmbeddingManager  # noqa: E402
@@ -232,6 +232,9 @@ class GemiAsistaniApp(*_APP_BASES):
             self.content,
             on_provider_change=self._on_provider_change,
             on_select_model=self._on_select_model,
+        )
+        self.downloads_view = DownloadsView(
+            self.content,
             on_download=self._on_download_model,
             on_cancel_download=self._on_cancel_download,
             on_delete_model=self._on_delete_model,
@@ -246,6 +249,7 @@ class GemiAsistaniApp(*_APP_BASES):
         self._views = {
             "chat": self.chat,
             "models": self.models_view,
+            "downloads": self.downloads_view,
             "settings": self.settings_view,
         }
         for view in self._views.values():
@@ -318,6 +322,7 @@ class GemiAsistaniApp(*_APP_BASES):
         self.rail.set_controls_enabled(not busy)
         self.settings_view.set_controls_enabled(not busy)
         self.models_view.set_controls_enabled(not busy)
+        self.downloads_view.set_controls_enabled(not busy)
         self.chat.set_input_enabled(not busy)
         if status:
             self.rail.set_status(status, "orange" if busy else "lightgreen")
@@ -423,15 +428,16 @@ class GemiAsistaniApp(*_APP_BASES):
         downloaded = self.model_manager.list_downloaded()
         active = self.models_view.get_active_model()
         self.models_view.set_downloaded_models(downloaded, active=active)
-        self.models_view.set_curated(self.model_manager.curated(), downloaded)
+        self.downloads_view.set_curated(self.model_manager.curated(), downloaded)
 
     def _on_download_model(self, model: dict) -> None:
         """Bir GGUF modelini arka planda indirir (ilerleme + iptal)."""
         if self._busy:
             return
         self._download_cancel = threading.Event()
-        self.models_view.show_progress(True)
-        self.models_view.set_progress(
+        self._show_view("downloads")
+        self.downloads_view.show_progress(True)
+        self.downloads_view.set_progress(
             0, model.get("approx_mb", 0) * 1024 * 1024,
             f"İndiriliyor: {model['label']}",
         )
@@ -445,7 +451,7 @@ class GemiAsistaniApp(*_APP_BASES):
             def cb(done, total):
                 if done - last["sent"] >= 16 * 1024 * 1024 or done >= total:
                     last["sent"] = done
-                    self._post_ui(lambda d=done, t=total: self.models_view.set_progress(d, t))
+                    self._post_ui(lambda d=done, t=total: self.downloads_view.set_progress(d, t))
             return self.model_manager.download(
                 model["repo_id"], model["filename"],
                 progress_cb=cb, cancel_event=cancel,
@@ -453,7 +459,7 @@ class GemiAsistaniApp(*_APP_BASES):
 
         def done(result, error):
             self._set_busy(False)
-            self.models_view.show_progress(False)
+            self.downloads_view.show_progress(False)
             if error:
                 msg = str(error)
                 if "iptal" in msg.lower():

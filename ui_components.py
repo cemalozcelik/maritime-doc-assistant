@@ -90,20 +90,22 @@ class ChatHistoryRail(ctk.CTkFrame):
         self.list_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         self.list_frame.grid_columnconfigure(0, weight=1)
 
-        # --- Gezinme düğmeleri (alt) ---
+        # --- Gezinme düğmeleri (alt, 2x2 ızgara) ---
         nav = ctk.CTkFrame(self, fg_color="transparent")
         nav.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 6))
-        nav.grid_columnconfigure((0, 1, 2), weight=1)
+        nav.grid_columnconfigure((0, 1), weight=1)
         self._nav_btns: Dict[str, ctk.CTkButton] = {}
-        for i, (key, text) in enumerate(
-            (("chat", "Sohbet"), ("models", "Modeller"), ("settings", "Ayarlar"))
-        ):
+        nav_items = (
+            ("chat", "Sohbet"), ("models", "Modeller"),
+            ("downloads", "İndirilenler"), ("settings", "Ayarlar"),
+        )
+        for i, (key, text) in enumerate(nav_items):
             btn = ctk.CTkButton(
-                nav, text=text, height=32, width=70,
+                nav, text=text, height=32,
                 font=ctk.CTkFont(size=12),
                 command=lambda k=key: self._on_show_view(k),
             )
-            btn.grid(row=0, column=i, sticky="ew", padx=2)
+            btn.grid(row=i // 2, column=i % 2, sticky="ew", padx=2, pady=2)
             self._nav_btns[key] = btn
 
         # --- Durum çubuğu (en altta) ---
@@ -353,8 +355,9 @@ class ChatArea(ctk.CTkFrame):
 # ---------------------------------------------------------------------------
 class ModelsView(ctk.CTkFrame):
     """
-    Sağlayıcı seçimi (Gemini / Yerel) ve yerel modellerin indirilmesi, seçilmesi
-    ve silinmesi. Gemini için API anahtarı girişi de buradadır.
+    Sağlayıcı seçimi (Gemini / Yerel) ve aktif yerel modelin seçimi. Gemini için
+    API anahtarı girişi de buradadır. Model indirme işlemi ayrı 'İndirilenler'
+    görünümündedir (DownloadsView).
     """
 
     PROVIDER_GEMINI = "Gemini (Çevrimiçi)"
@@ -365,21 +368,14 @@ class ModelsView(ctk.CTkFrame):
         master,
         on_provider_change: Callable[[str], None],
         on_select_model: Callable[[str], None],
-        on_download: Callable[[Dict], None],
-        on_cancel_download: Callable[[], None],
-        on_delete_model: Callable[[str], None],
         **kwargs,
     ) -> None:
         super().__init__(master, corner_radius=0, **kwargs)
         self._on_provider_change = on_provider_change
         self._on_select_model = on_select_model
-        self._on_download = on_download
-        self._on_cancel_download = on_cancel_download
-        self._on_delete_model = on_delete_model
-        self._curated_rows: List[ctk.CTkBaseClass] = []
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(5, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
         ctk.CTkLabel(
             self, text="Modeller ve Sağlayıcı",
@@ -435,31 +431,12 @@ class ModelsView(ctk.CTkFrame):
         self.active_menu.pack(side="left", fill="x", expand=True)
 
         ctk.CTkLabel(
-            self.local_frame, text="İndirilebilir modeller:",
-            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
-        ).pack(fill="x", pady=(6, 2))
-
-        self.curated_frame = ctk.CTkScrollableFrame(self.local_frame, fg_color="transparent")
-        self.curated_frame.pack(fill="both", expand=True)
-        self.curated_frame.grid_columnconfigure(0, weight=1)
-
-        # --- İndirme ilerleme alanı ---
-        self.progress_frame = ctk.CTkFrame(self.local_frame, fg_color="transparent")
-        self.progress_label = ctk.CTkLabel(
-            self.progress_frame, text="", font=ctk.CTkFont(size=12), anchor="w",
-        )
-        self.progress_label.pack(fill="x")
-        prog_row = ctk.CTkFrame(self.progress_frame, fg_color="transparent")
-        prog_row.pack(fill="x", pady=(2, 0))
-        prog_row.grid_columnconfigure(0, weight=1)
-        self.progress_bar = ctk.CTkProgressBar(prog_row)
-        self.progress_bar.set(0)
-        self.progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self.cancel_btn = ctk.CTkButton(
-            prog_row, text="İptal", width=80, command=self._on_cancel_download,
-            fg_color="#8a2c2c", hover_color="#a83232",
-        )
-        self.cancel_btn.grid(row=0, column=1)
+            self.local_frame,
+            text="Yeni model indirmek veya silmek için sol menüden 'İndirilenler' "
+                 "sekmesini kullanın. İndirilen modeller burada listelenir.",
+            font=ctk.CTkFont(size=11), text_color="gray60", anchor="w",
+            justify="left", wraplength=560,
+        ).pack(fill="x", pady=(2, 0))
 
         # Yerel/gemini başlangıç görünürlüğü.
         self._handle_provider_change(self.PROVIDER_LOCAL)
@@ -471,8 +448,7 @@ class ModelsView(ctk.CTkFrame):
         if value.startswith("Gemini"):
             self.gemini_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(4, 10))
         else:
-            self.local_frame.grid(row=2, column=0, rowspan=4, sticky="nsew",
-                                  padx=20, pady=(4, 10))
+            self.local_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(4, 10))
         if self._on_provider_change:
             self._on_provider_change(value)
 
@@ -503,9 +479,83 @@ class ModelsView(ctk.CTkFrame):
     def get_active_model(self) -> str:
         return self.active_menu.get()
 
-    # -- İndirilebilir liste ---------------------------------------------- #
+    def set_controls_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self.provider_seg.configure(state=state)
+        self.active_menu.configure(state=state)
+
+
+# ---------------------------------------------------------------------------
+#  İndirilenler Görünümü (Model kataloğu + indirme)
+# ---------------------------------------------------------------------------
+class DownloadsView(ctk.CTkFrame):
+    """
+    Tüm model kataloğunu (indirilmiş + indirilebilir) listeleyen ayrı görünüm.
+    Her satırda modelin boyutu/açıklaması ve durumuna göre 'İndir' veya 'Sil'
+    düğmesi bulunur. Başka bilgisayarlara kurulumda hangi modellerin mevcut
+    olduğunu görüp indirmek için tasarlanmıştır. Sağlayıcı seçiminden bağımsız
+    olarak her zaman erişilebilir.
+    """
+
+    def __init__(
+        self,
+        master,
+        on_download: Callable[[Dict], None],
+        on_cancel_download: Callable[[], None],
+        on_delete_model: Callable[[str], None],
+        **kwargs,
+    ) -> None:
+        super().__init__(master, corner_radius=0, **kwargs)
+        self._on_download = on_download
+        self._on_cancel_download = on_cancel_download
+        self._on_delete_model = on_delete_model
+        self._curated_rows: List[ctk.CTkBaseClass] = []
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(
+            self, text="İndirilenler",
+            font=ctk.CTkFont(size=20, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=20, pady=(20, 4))
+
+        ctk.CTkLabel(
+            self,
+            text="Tüm modeller aşağıda listelenir. İndirilen modeller çevrimdışı "
+                 "kullanılabilir ve 'Modeller' sekmesinden aktif model olarak "
+                 "seçilebilir. İndirilen '.gguf' dosyalarını başka bir bilgisayarın "
+                 "aynı klasörüne kopyalayarak da taşıyabilirsiniz.",
+            font=ctk.CTkFont(size=12), text_color="gray60", anchor="w",
+            justify="left", wraplength=620,
+        ).grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
+
+        self.curated_frame = ctk.CTkScrollableFrame(
+            self, label_text="Model Kataloğu", fg_color="transparent"
+        )
+        self.curated_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        self.curated_frame.grid_columnconfigure(0, weight=1)
+
+        # --- İndirme ilerleme alanı ---
+        self.progress_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.progress_label = ctk.CTkLabel(
+            self.progress_frame, text="", font=ctk.CTkFont(size=12), anchor="w",
+        )
+        self.progress_label.pack(fill="x")
+        prog_row = ctk.CTkFrame(self.progress_frame, fg_color="transparent")
+        prog_row.pack(fill="x", pady=(2, 0))
+        prog_row.grid_columnconfigure(0, weight=1)
+        self.progress_bar = ctk.CTkProgressBar(prog_row)
+        self.progress_bar.set(0)
+        self.progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.cancel_btn = ctk.CTkButton(
+            prog_row, text="İptal", width=80, command=self._on_cancel_download,
+            fg_color="#8a2c2c", hover_color="#a83232",
+        )
+        self.cancel_btn.grid(row=0, column=1)
+
+    # -- Katalog ----------------------------------------------------------- #
     def set_curated(self, curated: List[Dict], downloaded: List[str]) -> None:
-        """İndirilebilir model satırlarını çizer (durumlarına göre düğmeler)."""
+        """Model satırlarını çizer (durumlarına göre İndir/Sil düğmesi)."""
         for w in self._curated_rows:
             w.destroy()
         self._curated_rows.clear()
@@ -516,11 +566,12 @@ class ModelsView(ctk.CTkFrame):
             row.grid(row=i, column=0, sticky="ew", pady=3)
             row.grid_columnconfigure(0, weight=1)
 
+            durum = "İndirildi" if is_down else f"~{m['approx_mb']/1024:.1f} GB"
             info = (f"{m['label']}\n{m['params']} · {m['quant']} · "
-                    f"~{m['approx_mb']/1024:.1f} GB — {m['note']}")
+                    f"{durum} — {m['note']}")
             ctk.CTkLabel(
                 row, text=info, justify="left", anchor="w",
-                font=ctk.CTkFont(size=12), wraplength=420,
+                font=ctk.CTkFont(size=12), wraplength=480,
             ).grid(row=0, column=0, sticky="ew", padx=10, pady=8)
 
             if is_down:
@@ -540,9 +591,9 @@ class ModelsView(ctk.CTkFrame):
     # -- İndirme ilerleme -------------------------------------------------- #
     def show_progress(self, visible: bool) -> None:
         if visible:
-            self.progress_frame.pack(fill="x", pady=(8, 0))
+            self.progress_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
         else:
-            self.progress_frame.pack_forget()
+            self.progress_frame.grid_forget()
 
     def set_progress(self, done: int, total: int, label: str = "") -> None:
         frac = (done / total) if total else 0
@@ -556,9 +607,9 @@ class ModelsView(ctk.CTkFrame):
             )
 
     def set_controls_enabled(self, enabled: bool) -> None:
-        state = "normal" if enabled else "disabled"
-        self.provider_seg.configure(state=state)
-        self.active_menu.configure(state=state)
+        # İndirme satırlarındaki düğmeler set_curated ile yeniden çizilir;
+        # burada özel bir kilitleme gerekmez (meşgulken yeni indirme başlatılmaz).
+        pass
 
 
 # ---------------------------------------------------------------------------
