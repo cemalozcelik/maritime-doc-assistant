@@ -27,6 +27,7 @@ import io
 import re
 import time
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Optional, Any, Dict
 
@@ -139,6 +140,22 @@ def extract_text_from_ocr_result(result: Any, debug_raw_path: Optional[str] = No
         return ""
 
 
+# Kelime-benzeri token (en az 2 harf; Türkçe dahil). Gerçek metni OCR
+# gürültüsünden (kopuk semboller, rastgele kısa parçalar) ayırmak için kullanılır.
+_WORD_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü]{2,}")
+
+
+def meaningful_len(text: str) -> int:
+    """
+    'Anlamlı' karakter sayısı: en az 2 harften oluşan kelime-benzeri token'ların
+    toplam uzunluğu. Yanlış rotasyondan / saf gürültüden gelen metinde bu değer
+    çok düşük, gerçek metinde yüksektir. Rotasyon kabul/ret kararında kullanılır.
+    """
+    if not text:
+        return 0
+    return sum(len(w) for w in _WORD_RE.findall(text))
+
+
 def _score_ocr_result(result: Any, text: str) -> float:
     """
     Bir OCR sonucunu puanlar (rotasyon seçimi için). Güven skorları varsa
@@ -247,9 +264,24 @@ class DocumentProcessor:
     # Daha azı çıkarsa sayfa "taranmış (scanned)" kabul edilip OCR'a yönlendirilir.
     MIN_TEXT_THRESHOLD = 20
 
-    # Rotasyon denemesinde 0 derece bu kadar metin verdiyse diğer açıları DENEME
-    # (sayfa düzgün/upright; gereksiz 4x OCR'dan kaçınılır).
+    # Rotasyon denemesinde İLK denenen açı (0 veya dominant) bu kadar metin
+    # verdiyse diğer açıları DENEME (gereksiz 4x OCR'dan kaçınılır).
     ROT_FASTPATH_CHARS = 240
+    # Dominant açı belge için zaten DOĞRU bilindiğinden, az da olsa gerçek metin
+    # verdiyse ona güveniriz; diğer açılara yalnızca sonuç bu kadar bile metin
+    # vermezse (sayfa yanlış yönde veya boş) düşeriz. Düşük eşik = bulk sayfalarda
+    # tek OCR çağrısı = hız.
+    ROT_ACCEPT_MIN = 25
+    # Bir sayfanın dominant rotasyon TESPİTİNE katkı sayılması için (güvenilir
+    # sinyal) gereken en az metin. Tespit eşiği kabul eşiğinden yüksek tutulur.
+    ROT_PREFERRED_MIN = 80
+
+    # Belge-geneli dominant rotasyon tespiti: ilk bu kadar METİNLİ sayfa tüm
+    # açılarda taranır; sonra dominant açı belirlenip kalan sayfalarda önce o
+    # denenir (zayıf çıkarsa diğerlerine fallback). Tüm sayfaları 4x taramaktan
+    # çok daha hızlıdır.
+    ROT_PROBE_PAGES = 5   # En fazla bu kadar sayfa tam taranır.
+    ROT_PROBE_MIN = 3     # Bu kadar prob sonrası net çoğunluk varsa erken karar.
 
     # --- Chunk kalite filtresi (GEVŞETİLMİŞ) ---
     # Eski sürümdeki agresif gibberish filtresi gerçek teknik metni de eliyordu.
@@ -404,6 +436,10 @@ class DocumentProcessor:
             return ProcessResult(success=False, message=f"PDF açılamadı: {exc}")
 
         total_pages = len(document)
+        # Belge-geneli dominant rotasyon: ilk birkaç metinli sayfadan belirlenir,
+        # sonra kalan sayfalarda önce o denenir (hız için).
+        probe_rotations: List[int] = []
+        dominant_rotation: Optional[int] = None
         try:
             for page_number in range(total_pages):
                 page = document[page_number]
@@ -419,16 +455,30 @@ class DocumentProcessor:
                 elif self.enable_pdf_ocr_fallback:
                     t0 = time.perf_counter()
                     rendered = self._render_page_array(page)
-                    best = self._ocr_image_best(rendered, f"page_{page_label:03d}")
+                    best = self._ocr_image_best(
+                        rendered, f"page_{page_label:03d}", preferred=dominant_rotation
+                    )
                     ocr_time += time.perf_counter() - t0
                     page_text = clean_ocr_text(best["text"])
                     ocr_used = True
                     rotation = best["rotation"]
                     ocr_pages += 1
                     logger.info(
-                        "page=%d best_rotation=%d text_len=%d score=%.0f",
+                        "page=%d best_rotation=%d text_len=%d score=%.0f%s",
                         page_label, rotation, len(page_text), best["score"],
+                        " (dominant)" if dominant_rotation is not None else " (probe)",
                     )
+                    # Dominant henüz belirlenmediyse, GÜVENİLİR metinli sayfalarla
+                    # tespit et (anlamlı karakter yüksek eşik = sağlam sinyal).
+                    if dominant_rotation is None and meaningful_len(best["text"]) >= self.ROT_PREFERRED_MIN:
+                        probe_rotations.append(rotation)
+                        if (len(probe_rotations) >= self.ROT_PROBE_PAGES
+                                or self._rotation_decided(probe_rotations, self.ROT_PROBE_MIN)):
+                            dominant_rotation = Counter(probe_rotations).most_common(1)[0][0]
+                            logger.info(
+                                "Dokuman dominant rotasyonu: %d derece (problar: %s)",
+                                dominant_rotation, probe_rotations,
+                            )
                 else:
                     page_text = ""
 
@@ -506,37 +556,64 @@ class DocumentProcessor:
     # ------------------------------------------------------------------ #
     #  OCR Çekirdeği (rotasyon tespitli)
     # ------------------------------------------------------------------ #
-    def _ocr_image_best(self, arr, label: str) -> Dict[str, Any]:
-        """
-        Bir görüntüyü 0/90/180/270 derece deneyerek OCR eder ve en çok anlamlı
-        metin veren açının sonucunu döndürür: {text, rotation, score}.
-        0 derece yeterince metin verirse diğer açılar denenmez (hız için).
-        """
+    def _ocr_at_angle(self, arr, angle: int, label: str) -> Dict[str, Any]:
+        """Görüntüyü tek bir açıda OCR eder: {text, rotation, score}."""
         import numpy as np
-        best: Dict[str, Any] = {"text": "", "rotation": 0, "score": -1.0}
-        angles = [0, 90, 180, 270] if self.try_rotations else [0]
-        reader = self._get_ocr_reader()
+        k = (angle // 90) % 4
+        rotated = arr if k == 0 else np.rot90(arr, k)
+        rotated = np.ascontiguousarray(rotated)  # OCR için bellek-bitişik.
+        try:
+            result = self._get_ocr_reader().readtext(rotated, detail=1, paragraph=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("OCR hata (%s, %d derece): %s", label, angle, exc)
+            return {"text": "", "rotation": angle, "score": -1.0}
+        dbg = None
+        if self.debug_dir:
+            dbg = os.path.join(self._ocr_dir(), f"{label}_rot{angle}_raw.txt")
+        text = extract_text_from_ocr_result(result, debug_raw_path=dbg)
+        return {"text": text, "rotation": angle, "score": _score_ocr_result(result, text)}
 
-        for k, angle in enumerate(angles):
-            rotated = arr if angle == 0 else np.rot90(arr, k)
-            # numpy dizisini OCR'a verirken bellek-bitişik (contiguous) yap.
-            rotated = np.ascontiguousarray(rotated)
-            try:
-                result = reader.readtext(rotated, detail=1, paragraph=False)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("OCR hata (%s, %d derece): %s", label, angle, exc)
-                continue
-            dbg = None
-            if self.debug_dir:
-                dbg = os.path.join(self._ocr_dir(), f"{label}_rot{angle}_raw.txt")
-            text = extract_text_from_ocr_result(result, debug_raw_path=dbg)
-            score = _score_ocr_result(result, text)
-            if score > best["score"]:
-                best = {"text": text, "rotation": angle, "score": score}
-            # Hızlı yol: 0 derece zaten bol metin verdiyse diğerlerini deneme.
-            if angle == 0 and len(text) >= self.ROT_FASTPATH_CHARS:
-                break
+    def _ocr_image_best(self, arr, label: str,
+                        preferred: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Bir görüntüyü OCR eder ve en çok anlamlı metin veren rotasyonu seçer.
+
+        * try_rotations kapalıysa yalnızca 0 derece denenir.
+        * preferred (dominant açı) verilmişse ÖNCE o denenir; yeterli metin
+          (>= ROT_PREFERRED_MIN) verirse diğer açılar DENENMEZ (hız). Zayıfsa
+          kalan açılara fallback yapılır.
+        * preferred yoksa 0,90,180,270 tam taranır (0 derece bol metin verirse
+          erken durulur).
+        """
+        if not self.try_rotations:
+            return self._ocr_at_angle(arr, 0, label)
+
+        order = [0, 90, 180, 270]
+        if preferred is not None:
+            order = [preferred] + [a for a in order if a != preferred]
+
+        best: Dict[str, Any] = {"text": "", "rotation": 0, "score": -1.0}
+        for i, angle in enumerate(order):
+            cur = self._ocr_at_angle(arr, angle, label)
+            if cur["score"] > best["score"]:
+                best = cur
+            if i == 0:
+                # İlk denenen açı (0 veya dominant) zaten güçlüyse: bitir.
+                if meaningful_len(cur["text"]) >= self.ROT_FASTPATH_CHARS:
+                    break
+                # Dominant açı (doğru bilinen) az da olsa ANLAMLI metin verdiyse
+                # güven; sadece neredeyse boş veya saf gürültüyse diğerlerine düş.
+                if preferred is not None and meaningful_len(cur["text"]) >= self.ROT_ACCEPT_MIN:
+                    break
         return best
+
+    @staticmethod
+    def _rotation_decided(probes: List[int], min_n: int) -> bool:
+        """En az min_n prob varsa ve net çoğunluk (yarıdan fazla) oluştuysa True."""
+        if len(probes) < min_n:
+            return False
+        _angle, count = Counter(probes).most_common(1)[0]
+        return count > len(probes) / 2
 
     # ------------------------------------------------------------------ #
     #  Görsel İşleme (OCR)
