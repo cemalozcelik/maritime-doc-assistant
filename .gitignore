@@ -24,6 +24,9 @@ build/
 dist/
 *.spec.bak
 
+# Inno Setup kurulum çıktısı
+installer_output/
+
 # IDE / editör
 .vscode/
 .idea/

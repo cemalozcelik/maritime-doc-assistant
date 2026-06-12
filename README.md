@@ -232,13 +232,32 @@ Paketleme sırasında dikkat edilmesi gereken noktalar:
 - Veritabanı uygulama paketine gömülmez. `main.py`, ChromaDB verilerini çalıştırılabilir
   dosyanın yanındaki yazılabilir `data` klasörüne yazar.
 - Embedding ve OCR modelleri ayrıca dahil edilmelidir (bkz. Tamamen Çevrimdışı Dağıtım).
-- Gömülü motor (llama-cpp-python) spec'te `collect_all` ile toplanır. CUDA wheel'i
-  kullanıldığında `ggml-cuda.dll` çok büyüktür (~700 MB) ve paket boyutunu belirgin
-  artırır; sadece CPU dağıtımı için CPU wheel'i tercih edilebilir. CUDA wheel'i çalışma
-  anında cudart/cublas DLL'lerine ihtiyaç duyar; bunlar torch ile birlikte gelir ve
-  uygulama import öncesi `torch/lib` klasörünü DLL arama yoluna ekler.
+- Gömülü motor (llama-cpp-python) spec'te `collect_all` ile toplanır. LLM GPU
+  hızlandırması için `ggml-cuda.dll` (~700 MB) kullanılır; bunun muhtaç olduğu
+  cudart/cublas/cublasLt DLL'leri torch'un CUDA sürümü yerine küçük `nvidia-*-cu12`
+  paketlerinden gelir (boyut için torch CPU sürümü kullanılır). Uygulama import
+  öncesi bu DLL'leri DLL yoluna ekleyip önceden yükler.
 - GGUF modelleri pakete gömülmez; çalışma anında `data/models_gguf/`'a indirilir.
 - UPX sıkıştırması kapalıdır; torch/onnxruntime kütüphanelerini bozabilir.
+- Boyut optimizasyonu: spec, çalışma anında kullanılmayan `.lib`/`.pdb` dosyalarını
+  paketten eler ve CUDA DLL'lerinin çift kopyalanmasını önler. Sonuç uygulama klasörü
+  ~2.4 GB'dır (indirilen modeller `data/` altında ayrıdır).
+
+### Tek dosyalık kurulum (Inno Setup)
+
+Dağıtımı kolaylaştırmak için onedir klasörü tek bir `setup.exe`'ye paketlenebilir
+(`--onefile` ÖNERİLMEZ: ~2.4 GB her açılışta temp'e açılır, yavaş ve kararsızdır).
+
+1. [Inno Setup 6](https://jrsoftware.org/isinfo.php) kurun.
+2. Uygulamayı derleyin: `pyinstaller gemi_asistani.spec --clean --noconfirm`
+3. Kurulumu derleyin: `installer.iss`'i Inno Setup ile açıp "Compile" deyin, ya da
+   `"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss`
+4. Çıktı: `installer_output\GemiAsistani-Kurulum.exe` (tek dosya).
+
+Kurulum admin gerektirmez; uygulamayı kullanıcı profiline kurar (klasör yazılabilir
+kalır, modeller `data/`'ya iner). `data/` (test modelleri) kuruluma dahil edilmez.
+Not: İmzasız kurulum dosyası da Windows SmartScreen/Akıllı Uygulama Denetimi uyarısı
+verebilir; kalıcı çözüm kod imzalama sertifikasıdır.
 
 ---
 
