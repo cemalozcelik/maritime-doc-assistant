@@ -17,14 +17,14 @@ Gereksinim (yalnızca benchmark için):
     pip install psutil nvidia-ml-py
 
 Kullanım örnekleri:
-    # Ollama (lokal) ile, varsayılan sorularla:
-    python benchmark.py --provider ollama --model gemma3:27b
+    # Yerel (gömülü llama.cpp) ile, GGUF dosya yolu vererek:
+    python benchmark.py --provider local --model data/models_gguf/Qwen2.5-7B-Instruct-Q4_K_M.gguf
 
     # Gemini ile:
     python benchmark.py --provider gemini --model gemini-2.5-pro --api-key XYZ
 
     # Her soruyu 3 kez tekrarla (ortalama için), kendi sorularınla:
-    python benchmark.py --provider ollama --model llama3.1:8b --repeat 3 --questions sorular.txt
+    python benchmark.py --provider local --model <gguf-yolu> --repeat 3 --questions sorular.txt
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ def run_query(embedder: EmbeddingManager, llm: LLMConnector, question: str) -> d
         "input_tokens": meta.get("input_tokens"),
         "output_tokens": meta.get("output_tokens"),
         "total_tokens": meta.get("total_tokens"),
-        "model_output_tps": meta.get("output_tps"),  # Ollama'da modelin saf hızı
+        "model_output_tps": meta.get("output_tps"),  # modelin saf üretim hızı (tok/sn)
         "retrieval_s": round(t1 - t0, 3),
         "generation_s": round(t2 - t1, 3),
         "total_s": round(t2 - t0, 3),
@@ -153,8 +153,9 @@ def print_aggregate(rows: List[dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Gemi Asistanı performans benchmark aracı")
-    parser.add_argument("--provider", choices=["ollama", "gemini"], default="ollama")
-    parser.add_argument("--model", default="gemma3:27b", help="Model adı")
+    parser.add_argument("--provider", choices=["local", "gemini"], default="local")
+    parser.add_argument("--model", default="",
+                        help="Yerel için GGUF dosya yolu; Gemini için model adı")
     parser.add_argument("--api-key", default=os.environ.get("GEMINI_API_KEY", ""),
                         help="Gemini API anahtarı (gemini için)")
     parser.add_argument("--repeat", type=int, default=1, help="Her soruyu kaç kez çalıştır")
@@ -198,9 +199,11 @@ def main() -> None:
     if args.provider == "gemini":
         if not args.api_key:
             parser.error("Gemini için --api-key (veya GEMINI_API_KEY) gerekli.")
-        llm.use_gemini(api_key=args.api_key, model_name=args.model)
+        llm.use_gemini(api_key=args.api_key, model_name=args.model or "gemini-2.5-pro")
     else:
-        llm.use_ollama(model_name=args.model)
+        if not args.model or not os.path.isfile(args.model):
+            parser.error("Yerel için --model ile geçerli bir GGUF dosya yolu verin.")
+        llm.use_local(model_path=args.model)
 
     # Çalıştır.
     rows: List[dict] = []

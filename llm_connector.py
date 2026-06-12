@@ -4,12 +4,13 @@ llm_connector.py
 ================
 RAG hattının "Generation" katmanı. Kullanıcının seçimine göre:
     * Gemini API (internet varken)  -> google-genai (yeni Google Gen AI SDK)
-    * Ollama (internet yokken)      -> localhost REST API (llama3, mistral, gemma...)
+    * Yerel Model (internet yokken) -> gömülü llama.cpp motoru (llama-cpp-python),
+      arayüzden indirilmiş GGUF dosyalarını çalıştırır. Harici program gerekmez.
 
 Sorumluluklar (SRP):
     * Sağlayıcılara bağlanma ve cevap üretme.
     * Soru + bağlam parçalarından gemicilik odaklı bir prompt oluşturma.
-    * Ollama erişilebilirliğini kontrol etme ve mevcut modelleri listeleme.
+    * Yerel motoru (GGUF) yükleme ve cevap üretme.
 
 Tasarım: Strateji deseni (Strategy Pattern). Her sağlayıcı ortak bir arayüzü
 (BaseLLMConnector) uygular; LLMConnector cephesi (facade) doğru stratejiyi seçer.
@@ -18,14 +19,38 @@ Bu, Açık/Kapalı Prensibi'ne (OCP) uygundur: yeni sağlayıcı eklemek mevcut 
 
 from __future__ import annotations
 
+import os
+import re
+import time
 import logging
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Ollama varsayılan adresi (lokal).
-DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+# Gömülü motor (llama-cpp-python) CUDA wheel'i, CUDA runtime DLL'lerine (cudart,
+# cublas...) ihtiyaç duyar. Bu DLL'ler torch'un cu1xx dağıtımıyla 'torch/lib'
+# içinde gelir. llama_cpp import edilmeden ÖNCE bu klasörü Windows'un DLL arama
+# yoluna ekleriz; aksi halde 'Could not find module llama.dll (or one of its
+# dependencies)' hatası alınır. CPU wheel'inde bu adım zararsızdır.
+_LLAMA_DLL_READY = False
+
+
+def _ensure_llama_loadable() -> None:
+    """llama_cpp import edilebilmesi için CUDA DLL arama yolunu hazırlar (Windows)."""
+    global _LLAMA_DLL_READY
+    if _LLAMA_DLL_READY:
+        return
+    _LLAMA_DLL_READY = True
+    if os.name != "nt":
+        return
+    try:
+        import torch  # torch zaten embedding için kurulu.
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.isdir(torch_lib):
+            os.add_dll_directory(torch_lib)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("torch/lib DLL yolu eklenemedi: %s", exc)
 
 # Gemicilik bağlamına özel sistem yönergesi (system prompt).
 SYSTEM_PROMPT = (
@@ -232,164 +257,157 @@ class GeminiConnector(BaseLLMConnector):
 
 
 # ---------------------------------------------------------------------------
-#  Ollama (Lokal)
+#  Yerel Model (gömülü llama.cpp / GGUF)
 # ---------------------------------------------------------------------------
-class OllamaConnector(BaseLLMConnector):
-    """Lokal Ollama sunucusu bağlantısı (internet gerektirmez)."""
+class LocalLLMConnector(BaseLLMConnector):
+    """
+    Gömülü llama.cpp motoruyla (llama-cpp-python) yerel bir GGUF modelini
+    çalıştırır. Harici bir program (Ollama vb.) gerektirmez; model dosyası
+    bir kez indirildikten sonra tamamen çevrimdışı çalışır.
 
-    # Streaming kullandığımız için bu, "token'lar arası izin verilen en uzun
-    # boşluk" (read timeout) anlamına gelir; toplam cevap süresi değil. İlk
-    # token, büyük bağlamın işlenmesi nedeniyle yavaş donanımda dakikalar
-    # sürebileceğinden geniş tutulur. Token akışı başladıktan sonra her token
-    # bu süreyi sıfırlar; böylece uzun cevaplar timeout'a takılmaz.
-    DEFAULT_TIMEOUT = 600  # saniye (token'lar arası azami bekleme)
-    CONNECT_TIMEOUT = 10   # saniye (sunucuya bağlanma)
+    Yüklenen model örnekte (RAM/VRAM) tutulur; aynı bağlayıcı yeniden
+    kullanıldığında model tekrar yüklenmez.
+    """
+
+    # Bağlam penceresi: RAG promptu (sistem + 8 bağlam parçası + soru) sığmalı.
+    DEFAULT_N_CTX = 8192
+    MAX_OUTPUT_TOKENS = 2048
 
     def __init__(
         self,
-        model_name: str = "llama3",
-        host: str = DEFAULT_OLLAMA_HOST,
-        timeout: int = DEFAULT_TIMEOUT,
+        model_path: str,
+        n_gpu_layers: int = -1,
+        n_ctx: int = DEFAULT_N_CTX,
     ) -> None:
-        self.model_name = model_name
-        self.host = host.rstrip("/")
-        self.timeout = timeout
-        self._details_cache: Optional[dict] = None  # /api/show sonucu (önbellek)
+        """
+        :param model_path: GGUF dosyasının tam yolu.
+        :param n_gpu_layers: GPU'ya boşaltılacak katman sayısı (-1: hepsi).
+            CPU-only kurulumda yok sayılır ve model CPU'da çalışır.
+        """
+        self.model_path = model_path
+        self.n_gpu_layers = n_gpu_layers
+        self.n_ctx = n_ctx
+        self._llm = None  # Tembel yüklenen Llama örneği (cache).
+
+    def _get_llm(self):
+        """Llama modelini bir kez yükler ve önbelleğe alır."""
+        if self._llm is not None:
+            return self._llm
+        _ensure_llama_loadable()
+        try:
+            from llama_cpp import Llama
+        except ImportError as exc:
+            raise ImportError(
+                "llama-cpp-python kurulu değil. 'pip install llama-cpp-python' "
+                "çalıştırın (GPU için CUDA wheel'i gerekir)."
+            ) from exc
+        if not self.model_path or not os.path.isfile(self.model_path):
+            raise FileNotFoundError(
+                f"Model dosyası bulunamadı: {self.model_path}. "
+                "Modeli 'Modeller' sekmesinden indirin."
+            )
+        logger.info("Yerel model yükleniyor: %s (n_gpu_layers=%s)",
+                    self.model_path, self.n_gpu_layers)
+        self._llm = Llama(
+            model_path=self.model_path,
+            n_gpu_layers=self.n_gpu_layers,
+            n_ctx=self.n_ctx,
+            verbose=False,
+        )
+        return self._llm
 
     def generate(self, prompt: str) -> LLMResponse:
         try:
-            import requests
-        except ImportError as exc:
-            raise ImportError("requests kurulu değil. 'pip install requests'.") from exc
-
-        url = f"{self.host}/api/generate"
-        payload = {
-            "model": self.model_name,
-            "prompt": prompt,
-            "stream": True,             # Akışlı: token geldikçe oku.
-            "options": {"temperature": 0.2},
-        }
-        try:
-            import json as _json
-
-            # timeout=(bağlanma, okuma). 'stream=True' ile okuma zaman aşımı her
-            # token'da sıfırlanır; tek bir token > self.timeout sürmedikçe takılmaz.
-            resp = requests.post(
-                url, json=payload, stream=True,
-                timeout=(self.CONNECT_TIMEOUT, self.timeout),
+            llm = self._get_llm()
+        except (ImportError, FileNotFoundError) as exc:
+            return LLMResponse("", success=False, error=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Yerel model yüklenemedi: %s", exc)
+            return LLMResponse(
+                "", success=False, error=f"Yerel model yüklenemedi: {exc}"
             )
-            resp.raise_for_status()
 
+        try:
+            t0 = time.perf_counter()
+            # GGUF içindeki sohbet şablonu otomatik uygulanır (create_chat_completion).
+            stream = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                stream=True,
+                temperature=0.3,
+                top_p=0.9,
+                top_k=40,
+                # Küçük modellerin düştüğü tekrar (kelime/cümle döngüsü)
+                # sorununu engellemek için ceza terimleri.
+                repeat_penalty=1.18,
+                frequency_penalty=0.4,
+                presence_penalty=0.3,
+                max_tokens=self.MAX_OUTPUT_TOKENS,
+            )
             parts: List[str] = []
-            final: dict = {}
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                try:
-                    chunk = _json.loads(line)
-                except ValueError:
-                    continue  # Bozuk/yarım satırı atla.
-                parts.append(chunk.get("response", "") or "")
-                if chunk.get("done"):
-                    final = chunk  # Son chunk token sayıları/süreleri içerir.
-                    break
+            for chunk in stream:
+                delta = (chunk.get("choices") or [{}])[0].get("delta", {})
+                piece = delta.get("content")
+                if piece:
+                    parts.append(piece)
+            elapsed = time.perf_counter() - t0
+
             text = "".join(parts).strip()
             if not text:
-                return LLMResponse("", success=False, error="Ollama boş cevap döndürdü.")
-            meta = self._build_meta(final)
-            meta.update(self._model_details())  # parametre sayısı, quantization
-            return LLMResponse(text, meta=meta)
-        except requests.exceptions.ConnectionError:
-            return LLMResponse(
-                "",
-                success=False,
-                error="Ollama sunucusuna bağlanılamadı. "
-                      "Lütfen 'ollama serve' komutunun çalıştığından emin olun.",
-            )
-        except requests.exceptions.HTTPError as exc:
-            return LLMResponse(
-                "",
-                success=False,
-                error=f"Ollama HTTP hatası: {exc}. Model '{self.model_name}' indirilmiş mi? "
-                      f"('ollama pull {self.model_name}')",
-            )
+                return LLMResponse(
+                    "", success=False, error="Yerel model boş cevap döndürdü."
+                )
+            return LLMResponse(text, meta=self._build_meta(llm, prompt, text, elapsed))
         except Exception as exc:  # noqa: BLE001
-            logger.error("Ollama hatası: %s", exc)
-            return LLMResponse("", success=False, error=f"Ollama hatası: {exc}")
+            logger.error("Yerel model hatası: %s", exc)
+            return LLMResponse("", success=False, error=f"Yerel model hatası: {exc}")
 
-    def _model_details(self) -> dict:
+    def _build_meta(self, llm, prompt: str, text: str, elapsed: float) -> dict:
         """
-        Modelin parametre sayısı ve quantization bilgisini /api/show'dan alır
-        (bir kez sorgulanıp önbelleğe alınır). Hata olursa boş döner.
+        Performans bloğu için ölçüm verisi üretir. Token sayıları, modelin
+        tokenizer'ı ile yaklaşık hesaplanır (akışta token sayacı verilmez).
         """
-        if self._details_cache is not None:
-            return self._details_cache
-        out: dict = {}
+        filename = os.path.basename(self.model_path)
+        meta = {"provider": "local", "model": filename}
+        meta.update(self._parse_name(filename))
+
+        in_tok = out_tok = None
         try:
-            import requests
-            resp = requests.post(
-                f"{self.host}/api/show", json={"name": self.model_name}, timeout=10
-            )
-            resp.raise_for_status()
-            details = (resp.json().get("details") or {})
-            if details.get("parameter_size"):
-                out["parameters"] = details["parameter_size"]
-            if details.get("quantization_level"):
-                out["quantization"] = details["quantization_level"]
+            in_tok = len(llm.tokenize(prompt.encode("utf-8")))
+            out_tok = len(llm.tokenize(text.encode("utf-8")))
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Ollama model detayları alınamadı: %s", exc)
-        self._details_cache = out
-        return out
+            logger.debug("Token sayımı yapılamadı: %s", exc)
 
-    @staticmethod
-    def _build_meta(final: dict) -> dict:
-        """
-        Ollama'nın son (done) chunk'ındaki ölçüm verilerini standart bir sözlüğe
-        çevirir. Süreler nanosaniyedir; saniyeye ve token/sn'ye dönüştürülür.
-        """
-        if not final:
-            return {}
-        ns = 1e9
-        in_tok = final.get("prompt_eval_count")
-        out_tok = final.get("eval_count")
-        eval_dur = final.get("eval_duration")        # çıktı üretim süresi (ns)
-        prompt_dur = final.get("prompt_eval_duration")  # girdi işleme süresi (ns)
-        meta = {
-            "provider": "ollama",
-            "model": final.get("model"),
+        meta.update({
             "input_tokens": in_tok,
             "output_tokens": out_tok,
             "total_tokens": (in_tok + out_tok) if (in_tok and out_tok) else None,
-            "load_s": (final.get("load_duration") or 0) / ns or None,
-            "prompt_eval_s": (prompt_dur / ns) if prompt_dur else None,
-            "eval_s": (eval_dur / ns) if eval_dur else None,
-            "total_s": (final.get("total_duration") or 0) / ns or None,
-        }
-        # Üretim hızı (token/saniye) — modelin saf çıktı hızı.
-        if out_tok and eval_dur:
-            meta["output_tps"] = round(out_tok / (eval_dur / ns), 2)
+            "eval_s": round(elapsed, 2),
+            "total_s": round(elapsed, 2),
+        })
+        if out_tok and elapsed > 0:
+            meta["output_tps"] = round(out_tok / elapsed, 2)
         return meta
 
-    def is_available(self) -> bool:
-        """Ollama sunucusu ayakta mı?"""
-        try:
-            import requests
-            resp = requests.get(f"{self.host}/api/tags", timeout=3)
-            return resp.status_code == 200
-        except Exception:  # noqa: BLE001
-            return False
+    @staticmethod
+    def _parse_name(filename: str) -> dict:
+        """Dosya adından parametre sayısı ve quantization çıkarır (varsa)."""
+        out: dict = {}
+        params = re.search(r"(\d+(?:\.\d+)?[Bb])(?:[-_.]|$)", filename)
+        if params:
+            out["parameters"] = params.group(1).upper()
+        quant = re.search(r"(Q\d[\w]*|F16|BF16|F32)", filename, re.IGNORECASE)
+        if quant:
+            out["quantization"] = quant.group(1).upper()
+        return out
 
-    def list_models(self) -> List[str]:
-        """Ollama'da indirilmiş mevcut modelleri listeler."""
+    def is_available(self) -> bool:
+        """llama-cpp-python import edilebiliyor ve model dosyası mevcut mu?"""
+        _ensure_llama_loadable()
         try:
-            import requests
-            resp = requests.get(f"{self.host}/api/tags", timeout=3)
-            resp.raise_for_status()
-            data = resp.json()
-            return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Ollama model listesi alınamadı: %s", exc)
-            return []
+            import llama_cpp  # noqa: F401
+        except (ImportError, OSError):
+            return False
+        return bool(self.model_path) and os.path.isfile(self.model_path)
 
 
 # ---------------------------------------------------------------------------
@@ -402,20 +420,33 @@ class LLMConnector:
     """
 
     PROVIDER_GEMINI = "Gemini (Çevrimiçi)"
-    PROVIDER_OLLAMA = "Ollama (Çevrimdışı)"
+    PROVIDER_LOCAL = "Yerel Model (Çevrimdışı)"
 
     def __init__(self) -> None:
         self._connector: Optional[BaseLLMConnector] = None
         self._provider_name: str = ""
+        # Aynı yerel model tekrar seçilirse motoru yeniden yüklememek için cache.
+        self._local_path: str = ""
 
     # -- Sağlayıcı seçimi -------------------------------------------------- #
     def use_gemini(self, api_key: str, model_name: str = "gemini-2.5-pro") -> None:
         self._connector = GeminiConnector(api_key=api_key, model_name=model_name)
         self._provider_name = self.PROVIDER_GEMINI
 
-    def use_ollama(self, model_name: str = "llama3", host: str = DEFAULT_OLLAMA_HOST) -> None:
-        self._connector = OllamaConnector(model_name=model_name, host=host)
-        self._provider_name = self.PROVIDER_OLLAMA
+    def use_local(self, model_path: str, n_gpu_layers: int = -1) -> None:
+        """Gömülü llama.cpp motoruyla yerel bir GGUF modelini kullanır."""
+        # Aynı model yolu zaten yüklüyse, yüklü motoru (RAM/VRAM) koru.
+        if (
+            isinstance(self._connector, LocalLLMConnector)
+            and self._local_path == model_path
+        ):
+            self._provider_name = self.PROVIDER_LOCAL
+            return
+        self._connector = LocalLLMConnector(
+            model_path=model_path, n_gpu_layers=n_gpu_layers
+        )
+        self._local_path = model_path
+        self._provider_name = self.PROVIDER_LOCAL
 
     @property
     def provider_name(self) -> str:
@@ -426,12 +457,14 @@ class LLMConnector:
 
     # -- Statik yardımcılar (UI'ın seçim yapmasına yardımcı) --------------- #
     @staticmethod
-    def check_ollama(host: str = DEFAULT_OLLAMA_HOST) -> bool:
-        return OllamaConnector(host=host).is_available()
-
-    @staticmethod
-    def get_ollama_models(host: str = DEFAULT_OLLAMA_HOST) -> List[str]:
-        return OllamaConnector(host=host).list_models()
+    def is_local_engine_available() -> bool:
+        """Gömülü motor (llama-cpp-python) kurulu ve yüklenebilir mi?"""
+        _ensure_llama_loadable()
+        try:
+            import llama_cpp  # noqa: F401
+            return True
+        except (ImportError, OSError):
+            return False
 
     # -- Prompt oluşturma -------------------------------------------------- #
     @staticmethod

@@ -44,7 +44,19 @@ easyocr>=1.7.1
 
 # --- LLM Bağlantıları ---
 google-genai>=1.0.0            # Gemini API - yeni Google Gen AI SDK (internet varken)
-requests>=2.31.0               # Ollama REST API (localhost, internet yokken)
+requests>=2.31.0               # Hugging Face'ten GGUF model indirme (akışlı)
+huggingface_hub>=0.20.0        # Model deposu yardımcıları (indirme/önbellek)
+#
+# Gömülü çevrimdışı motor: llama.cpp (Ollama GEREKMEZ). GGUF modelleri arayüzdeki
+# "Modeller" sekmesinden indirilir ve bu motorla yerelde çalıştırılır.
+#   Varsayılan (CPU): aşağıdaki satır PyPI'den CPU wheel'i kurar.
+#   GPU (CUDA) için: CUDA destekli wheel gerekir; CUDA sürümünüze uygun indeksi
+#   kullanın (torch ile aynı cuXXX). Örn. CUDA 12.1:
+#       pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+#   Not: CUDA wheel'i çalışma anında cudart/cublas DLL'lerine ihtiyaç duyar; bunlar
+#   torch'un cuXXX dağıtımıyla (torch/lib) gelir ve uygulama import öncesi bu klasörü
+#   DLL arama yoluna ekler.
+llama-cpp-python>=0.3.0
 
 # --- Performans ölçümü (uygulama içi metrik bloğu ve benchmark.py) ---
 psutil>=5.9.0                  # CPU / RAM ölçümü

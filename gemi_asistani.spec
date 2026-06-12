@@ -30,6 +30,8 @@ for pkg in [
     "easyocr",
     "onnxruntime",
     "google.genai",
+    "llama_cpp",        # Gömülü çevrimdışı motor (büyük: ggml-cuda.dll dahil).
+    "huggingface_hub",  # GGUF model indirme yardımcıları.
 ]:
     try:
         d, b, h = collect_all(pkg)

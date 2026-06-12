@@ -15,7 +15,8 @@ Uygulama, Retrieval-Augmented Generation (RAG) mimarisi üzerine kuruludur:
 2. Metin parçaları lokal bir embedding modeli ile vektörleştirilip kalıcı bir
    vektör veritabanına yazılır.
 3. Kullanıcının sorusu için en ilgili bağlam parçaları getirilir ve seçilen dil
-   modeline (çevrimiçi Gemini veya çevrimdışı Ollama) gönderilerek yanıt üretilir.
+   modeline (çevrimiçi Gemini veya çevrimdışı gömülü yerel model) gönderilerek
+   yanıt üretilir.
 
 Tüm embedding ve OCR işlemleri lokalde çalışır; internet yalnızca Gemini sağlayıcısı
 seçildiğinde gereklidir.
@@ -25,8 +26,17 @@ seçildiğinde gereklidir.
 ## Temel Özellikler
 
 - Çift dil modeli sağlayıcısı: internet varken Gemini API (varsayılan
-  gemini-2.5-pro), yokken Ollama (llama3, mistral, gemma vb.). Arayüzden tek tıkla
-  geçiş. Gemini bağlantısı güncel google-genai SDK'sı ile kurulur.
+  gemini-2.5-pro), yokken gömülü yerel motor (llama.cpp / GGUF). Arayüzden tek tıkla
+  geçiş. Gemini bağlantısı güncel google-genai SDK'sı ile kurulur. Çevrimdışı motor
+  için harici bir program (Ollama vb.) GEREKMEZ; tamamen uygulamaya gömülüdür.
+- Arayüzden model indirme: "Modeller" sekmesinden önerilen GGUF modelleri (Qwen2.5
+  1.5B/3B/7B, Llama 3.1 8B, Gemma 2 9B) tek tıkla, ilerleme çubuğuyla indirilir;
+  terminal veya harici komut gerekmez. İndirilen model aktif seçilip silinebilir.
+- Geçmiş sohbetler (Gemini benzeri): her sohbet diske kaydedilir; uygulama kapanıp
+  açıldığında sol panelde listede kalır. Yeni sohbet açma, geçmişe tıklayıp devam
+  etme ve silme desteklenir.
+- Gemini benzeri arayüz: solda geçmiş sohbet rayı ve Sohbet / Modeller / Ayarlar
+  gezinmesi; ortada sohbet alanı.
 - Etiketli hibrit yanıt: cevap önce yüklenen dokümana dayanır ("DOKÜMANDAN"),
   gerektiğinde genel mühendislik bilgisi ayrı ve açıkça etiketlenerek ("GENEL
   MÜHENDİSLİK BİLGİSİ — dokümanda doğrulanmadı") eklenir. Sayı ve parça numaraları
@@ -63,10 +73,12 @@ sorumluluğu vardır ve diğerlerine sıkı bağlı değildir.
 ```
 maritime-doc-assistant/
 ├── main.py                 Giriş noktası, ana pencere, modül koordinasyonu, thread yönetimi
-├── ui_components.py        CustomTkinter arayüz bileşenleri (sol panel ve sohbet alanı)
+├── ui_components.py        Arayüz bileşenleri (sohbet rayı, sohbet alanı, Modeller/Ayarlar)
 ├── document_processor.py   PDF okuma, metin parçalama, görsel/taranmış PDF OCR
 ├── embedding_manager.py    Lokal embedding, ChromaDB, benzerlik araması (RAG retrieval)
-├── llm_connector.py        Gemini / Ollama bağlantısı ve prompt yönetimi (RAG generation)
+├── llm_connector.py        Gemini / gömülü yerel motor bağlantısı ve prompt yönetimi
+├── model_manager.py        GGUF model kataloğu, indirme (ilerleme/iptal), silme
+├── chat_store.py           Kalıcı sohbet geçmişi (JSON oturumlar)
 ├── perf_monitor.py         CPU/RAM/GPU/VRAM örnekleme ve performans bloğu biçimlendirme
 ├── benchmark.py            Uçtan uca performans ölçüm (benchmark) aracı (komut satırı)
 ├── requirements.txt        Bağımlılıklar
@@ -86,7 +98,8 @@ maritime-doc-assistant/
 - Python 3.11 veya 3.12 (önerilir). PyTorch, EasyOCR ve sentence-transformers için
   Python 3.13/3.14'te kararlı paketler henüz bulunmayabilir.
 - Windows 10/11.
-- Çevrimdışı dil modeli için Ollama (isteğe bağlı).
+- Çevrimdışı dil modeli için harici program GEREKMEZ; motor (llama-cpp-python)
+  uygulamaya gömülüdür. GGUF modelleri arayüzden indirilir.
 
 ---
 
@@ -103,26 +116,31 @@ pip install -r requirements.txt
 python main.py
 ```
 
+GPU (NVIDIA CUDA) ile hızlı çevrimdışı çıkarım isterseniz, gömülü motoru CUDA
+destekli wheel ile kurun (torch ile aynı CUDA sürümü; örn. CUDA 12.1):
+
+```powershell
+pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+```
+
 İlk çalıştırmada embedding modeli (yaklaşık 1,1 GB) ve ilk OCR işleminde EasyOCR
-modelleri bir kez indirilir. Sonraki çalıştırmalar internetsiz gerçekleşir.
+modelleri bir kez indirilir. Yerel dil modeli (GGUF) ise "Modeller" sekmesinden bir
+kez indirilir. Bu indirmelerden sonra uygulama tamamen internetsiz çalışır.
 
 ---
 
 ## Kullanım
 
-1. Doküman ekleyin: sol panelden "Dosya Yükle" veya "Klasör Yükle" düğmesini kullanın,
-   ya da dosya/klasörü doğrudan pencereye sürükleyip bırakın.
-2. Dil modelini seçin:
-   - Gemini (çevrimiçi): API anahtarınızı girin.
-   - Ollama (çevrimdışı): "ollama serve" çalışırken "Yenile" düğmesine basıp modeli seçin.
-3. Soru sorun: alttaki metin kutusuna yazıp "Gönder" düğmesine basın. Yanıtın altında
-   kullanılan kaynaklar listelenir.
-
-Çevrimdışı dil modeli için hazırlık (internet varken bir kez):
-
-```powershell
-ollama pull llama3      # alternatif: mistral, gemma
-```
+1. Doküman ekleyin: "Ayarlar" sekmesinden "Dosya Yükle" veya "Klasör Yükle" düğmesini
+   kullanın, ya da dosya/klasörü doğrudan pencereye sürükleyip bırakın.
+2. Dil modelini seçin ("Modeller" sekmesi):
+   - Gemini (çevrimiçi): sağlayıcıyı Gemini yapıp API anahtarınızı girin.
+   - Yerel Model (çevrimdışı): bir GGUF model indirin (ör. Qwen2.5 3B), indikten sonra
+     "Aktif yerel model" olarak seçin.
+3. Soru sorun: "Sohbet" sekmesindeki metin kutusuna yazıp "Gönder" düğmesine basın.
+   Yanıtın altında kullanılan kaynaklar ve performans bloğu listelenir.
+4. Geçmiş sohbetler: sol panelde listelenir; "+ Yeni Sohbet" ile yeni başlatabilir,
+   bir geçmişe tıklayıp devam edebilir veya silebilirsiniz.
 
 ---
 
@@ -139,8 +157,8 @@ Tez/rapor için RAG hattının performansı iki yoldan ölçülebilir:
   tablo ve CSV olarak veren `benchmark.py`:
 
 ```powershell
-# Ollama (lokal):
-python benchmark.py --provider ollama --model llama3.1:8b --repeat 3
+# Yerel (gömülü llama.cpp) - GGUF dosya yolu verilir:
+python benchmark.py --provider local --model data/models_gguf/Qwen2.5-7B-Instruct-Q4_K_M.gguf --repeat 3
 
 # Gemini:
 python benchmark.py --provider gemini --model gemini-2.5-pro --api-key XYZ
@@ -177,6 +195,11 @@ EasyOCR modelleri ilk OCR işleminde `C:\Users\<kullanıcı>\.EasyOCR\model` diz
 iner. Bu dizin hedef bilgisayarda aynı konuma kopyalanmalı veya kod içinde
 `model_storage_directory` parametresiyle yönlendirilmelidir.
 
+Yerel dil modeli (GGUF): "Modeller" sekmesinden indirilen GGUF dosyaları, uygulamanın
+yanındaki `data/models_gguf/` klasörüne yazılır. İnternetin hiç bulunmayacağı bir hedef
+bilgisayar için bu klasörü olduğu gibi kopyalamak yeterlidir; model orada bulunursa
+indirme gerekmez.
+
 ---
 
 ## Windows .exe Paketleme
@@ -202,6 +225,12 @@ Paketleme sırasında dikkat edilmesi gereken noktalar:
 - Veritabanı uygulama paketine gömülmez. `main.py`, ChromaDB verilerini çalıştırılabilir
   dosyanın yanındaki yazılabilir `data` klasörüne yazar.
 - Embedding ve OCR modelleri ayrıca dahil edilmelidir (bkz. Tamamen Çevrimdışı Dağıtım).
+- Gömülü motor (llama-cpp-python) spec'te `collect_all` ile toplanır. CUDA wheel'i
+  kullanıldığında `ggml-cuda.dll` çok büyüktür (~700 MB) ve paket boyutunu belirgin
+  artırır; sadece CPU dağıtımı için CPU wheel'i tercih edilebilir. CUDA wheel'i çalışma
+  anında cudart/cublas DLL'lerine ihtiyaç duyar; bunlar torch ile birlikte gelir ve
+  uygulama import öncesi `torch/lib` klasörünü DLL arama yoluna ekler.
+- GGUF modelleri pakete gömülmez; çalışma anında `data/models_gguf/`'a indirilir.
 - UPX sıkıştırması kapalıdır; torch/onnxruntime kütüphanelerini bozabilir.
 
 ---
@@ -216,7 +245,9 @@ Paketleme sırasında dikkat edilmesi gereken noktalar:
 | Metin parçalama   | LangChain RecursiveCharacterTextSplitter             |
 | Embedding         | sentence-transformers, intfloat/multilingual-e5-base |
 | Vektör veritabanı | ChromaDB (persistent)                                |
-| Dil modeli        | Google Gemini API (google-genai), Ollama (lokal)     |
+| Dil modeli        | Google Gemini API (google-genai), gömülü llama.cpp (llama-cpp-python, GGUF) |
+| Model indirme     | huggingface_hub, requests (HF resolve, akışlı)       |
+| Sohbet geçmişi    | JSON oturum dosyaları (yerel disk)                   |
 | Performans ölçümü | psutil, nvidia-ml-py (pynvml)                        |
 | Paketleme         | PyInstaller                                          |
 
@@ -227,4 +258,5 @@ Paketleme sırasında dikkat edilmesi gereken noktalar:
 Bu depo için uygun bir lisans dosyası eklenebilir (örneğin MIT).
 
 Gemini sağlayıcısı internet bağlantısı ve geçerli bir API anahtarı gerektirir.
-Çevrimdışı çalışmanın tamamı Ollama ile lokal embedding ve OCR üzerinden sağlanır.
+Çevrimdışı çalışmanın tamamı gömülü yerel motor (llama.cpp / GGUF), lokal embedding
+ve OCR üzerinden sağlanır; harici bir program gerekmez.
