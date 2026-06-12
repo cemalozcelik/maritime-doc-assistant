@@ -32,6 +32,8 @@ for pkg in [
     "google.genai",
     "llama_cpp",        # Gömülü çevrimdışı motor (büyük: ggml-cuda.dll dahil).
     "huggingface_hub",  # GGUF model indirme yardımcıları.
+    "requests",         # HF arama + GGUF indirme (HTTPS).
+    "certifi",          # HTTPS için CA sertifika paketi (cacert.pem).
 ]:
     try:
         d, b, h = collect_all(pkg)
@@ -50,6 +52,13 @@ hiddenimports += [
     "chromadb.api.segment",
     "chromadb.segment.impl.vector.local_hnsw",
 ]
+
+# Uygulama ikonu (çalışan pencerede de kullanılmak üzere pakete eklenir).
+import os as _os
+if _os.path.isfile("icon.png"):
+    datas += [("icon.png", ".")]
+if _os.path.isfile("icon.ico"):
+    datas += [("icon.ico", ".")]
 
 # ----------------------------------------------------------------------------
 #  İSTEĞE BAĞLI: Embedding modelini .exe içine gömmek isterseniz, modeli
@@ -89,7 +98,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon="assets/app.ico",      # Kendi ikonunuzu eklemek isterseniz açın.
+    icon="icon.ico" if _os.path.isfile("icon.ico") else None,
 )
 
 coll = COLLECT(

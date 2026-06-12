@@ -182,6 +182,7 @@ class GemiAsistaniApp(*_APP_BASES):
         self.title("Gemi Teknik Doküman Asistanı")
         self.geometry("1200x760")
         self.minsize(1000, 640)
+        self._set_app_icon()
 
         data_dir = writable_data_dir()
 
@@ -274,6 +275,38 @@ class GemiAsistaniApp(*_APP_BASES):
 
         # Pencere kapatma olayı.
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ================================================================== #
+    #  Pencere İkonu
+    # ================================================================== #
+    def _set_app_icon(self) -> None:
+        """
+        Pencere/görev çubuğu ikonunu ayarlar. Windows'ta .ico (iconbitmap) en
+        güvenilir sonucu verir; ek olarak iconphoto (.png) ile diğer platformlar
+        ve görev çubuğu için yedek sağlanır. Dosya bulunamazsa sessizce geçilir.
+        """
+        def _find(name: str) -> Optional[str]:
+            for cand in (resource_path(name),
+                         os.path.join(os.path.dirname(os.path.abspath(__file__)), name)):
+                if os.path.isfile(cand):
+                    return cand
+            return None
+
+        ico = _find("icon.ico")
+        if ico and os.name == "nt":
+            try:
+                self.iconbitmap(ico)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("iconbitmap ayarlanamadı: %s", exc)
+
+        png = _find("icon.png")
+        if png:
+            try:
+                import tkinter as tk
+                self._icon_image = tk.PhotoImage(file=png)  # referans tutulmalı.
+                self.iconphoto(True, self._icon_image)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("iconphoto ayarlanamadı: %s", exc)
 
     # ================================================================== #
     #  Görünüm Yönetimi
