@@ -187,7 +187,14 @@ class GemiAsistaniApp(*_APP_BASES):
         data_dir = writable_data_dir()
 
         # --- İş modüllerini hazırla (modeller lazy yüklenir) ---
-        self.processor = DocumentProcessor(chunk_size=1000, chunk_overlap=200)
+        # balanced mod: DPI 200, çizim/şema dosyalarında OCR atlanır; sayfa-bazlı
+        # OCR önbelleği (2. yükleme çok hızlı).
+        self.processor = DocumentProcessor(
+            chunk_size=1000, chunk_overlap=200,
+            ingest_mode="balanced",
+            cache_dir=os.path.join(data_dir, "ocr_cache"),
+            drawings_dir=os.path.join(data_dir, "drawings"),
+        )
         self.embedder = EmbeddingManager(
             model_name_or_path=local_embedding_model_path(self.EMBEDDING_MODEL),
             persist_directory=os.path.join(data_dir, "vector_store"),
@@ -663,10 +670,13 @@ class GemiAsistaniApp(*_APP_BASES):
             skipped = 0
             messages = []
             # Tüm dosyalar için toplulaştırılmış içe aktarım istatistikleri.
-            agg = {"source": f"{total} dosya", "total_pages": 0, "pages_with_text": 0,
-                   "ocr_pages": 0, "total_chars": 0, "total_chunks": 0,
-                   "ocr_time": 0.0, "embedding_time": 0.0, "chroma_write_time": 0.0,
-                   "failed_pages": []}
+            agg = {"source": f"{total} dosya", "total_files": 0, "total_pages": 0,
+                   "text_layer_pages": 0, "ocr_required_pages": 0, "ocr_used_pages": 0,
+                   "ocr_executed_pages": 0, "ocr_skipped_pages": 0,
+                   "drawing_skipped_pages": 0, "cache_hit_pages": 0, "fallback_pages": 0,
+                   "total_ocr_calls": 0, "total_chars": 0, "total_chunks": 0,
+                   "text_time": 0.0, "ocr_time": 0.0, "embedding_time": 0.0,
+                   "chroma_time": 0.0, "failed_pages": [], "dominant_rotation_files": 0}
             existing = set(self.embedder.list_sources())
             for index, path in enumerate(paths, start=1):
                 name = os.path.basename(path)
@@ -686,24 +696,27 @@ class GemiAsistaniApp(*_APP_BASES):
                 )
                 result = self.processor.process_file(path)
                 st = result.stats or {}
-                agg["total_pages"] += st.get("total_pages", 0)
-                agg["pages_with_text"] += st.get("pages_with_text", 0)
-                agg["ocr_pages"] += st.get("ocr_pages", 0)
-                agg["total_chars"] += st.get("total_chars", 0)
-                agg["ocr_time"] += st.get("ocr_time", 0) or 0
+                agg["total_files"] += 1
+                for key in ("total_pages", "text_layer_pages", "ocr_required_pages",
+                            "ocr_used_pages", "ocr_executed_pages", "ocr_skipped_pages",
+                            "drawing_skipped_pages", "cache_hit_pages", "fallback_pages",
+                            "total_ocr_calls", "total_chars", "text_time", "ocr_time"):
+                    agg[key] += st.get(key, 0) or 0
                 for fp in (st.get("failed_pages") or []):
                     agg["failed_pages"].append(f"{name}:s{fp}")
+                if st.get("dominant_rotation") is not None:
+                    agg["dominant_rotation_files"] += 1
                 if result.success and result.chunks:
                     added = self.embedder.add_chunks(result.chunks)
                     total_chunks += added
                     agg["embedding_time"] += self.embedder.last_embedding_time
-                    agg["chroma_write_time"] += self.embedder.last_chroma_write_time
+                    agg["chroma_time"] += self.embedder.last_chroma_write_time
                     existing.add(name)
                     messages.append(f"[OK] {result.message}")
                 else:
                     messages.append(f"[HATA] {result.message}")
             agg["total_chunks"] = total_chunks
-            for key in ("ocr_time", "embedding_time", "chroma_write_time"):
+            for key in ("text_time", "ocr_time", "embedding_time", "chroma_time"):
                 agg[key] = round(agg[key], 2)
             return total_chunks, skipped, messages, agg
 

@@ -25,7 +25,9 @@ from __future__ import annotations
 import os
 import io
 import re
+import json
 import time
+import hashlib
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
@@ -156,6 +158,106 @@ def meaningful_len(text: str) -> int:
     return sum(len(w) for w in _WORD_RE.findall(text))
 
 
+# Geriye dönük/açık ad: meaningful_score == meaningful_len (yalnızca rotasyon
+# kararında kullanılır).
+meaningful_score = meaningful_len
+
+
+# ===========================================================================
+#  İçe Aktarım Modları, Çizim Tespiti, Dosya İmzası, OCR Önbelleği
+# ===========================================================================
+# Mod -> varsayılan ayarlar. Kullanıcı ocr_dpi / skip_drawings ile override edebilir.
+INGEST_MODES = {
+    "fast":     {"ocr_dpi": 150, "skip_drawings": True},
+    "balanced": {"ocr_dpi": 200, "skip_drawings": True},   # varsayılan
+    "full":     {"ocr_dpi": 300, "skip_drawings": False},
+}
+DEFAULT_INGEST_MODE = "balanced"
+
+# Teknik çizim/şema dosyalarını adından tanı (OCR'ı çoğu zaman gürültü üretir).
+_DRAWING_RE = re.compile(
+    r"\b(drawing|drawings|diagram|diagrams|schematic|schematics|piping|plan|"
+    r"plans|blueprint|dwg|layout|wiring)\b",
+    re.IGNORECASE,
+)
+
+
+def is_drawing_file(name: str) -> bool:
+    """Dosya adı teknik çizim/şema anahtar kelimesi içeriyor mu?"""
+    return bool(_DRAWING_RE.search(name or ""))
+
+
+def file_signature(path: str) -> str:
+    """
+    Dosya içeriğine dayalı hızlı imza (boyut + baş/orta/son 64 KB'ın SHA-1'i).
+    Tam hash kadar kesin değil ama pratikte çakışmaz; büyük PDF'lerde hızlıdır.
+    Önbellek anahtarının 'file_hash' bileşenidir.
+    """
+    h = hashlib.sha1()
+    try:
+        size = os.path.getsize(path)
+        h.update(str(size).encode())
+        with open(path, "rb") as fh:
+            for offset in (0, max(0, size // 2 - 32768), max(0, size - 65536)):
+                fh.seek(offset)
+                h.update(fh.read(65536))
+    except OSError:
+        h.update(os.path.basename(path).encode())
+    return h.hexdigest()[:16]
+
+
+class OcrCache:
+    """
+    Sayfa-bazlı OCR önbelleği. Anahtar: file_hash + page + dpi + engine +
+    languages + rotation_policy. Önbellekte varsa OCR yeniden çalıştırılmaz.
+
+    Her dosya için tek bir JSON dosyası ({cache_dir}/{file_hash}.json) kullanılır;
+    dosya işlenirken belleğe alınır, sonunda diske yazılır.
+    """
+
+    def __init__(self, cache_dir: str) -> None:
+        self.cache_dir = cache_dir
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self._mem: Dict[str, Dict[str, Any]] = {}
+
+    def _path(self, file_hash: str) -> str:
+        return os.path.join(self.cache_dir, f"{file_hash}.json")
+
+    def _file_map(self, file_hash: str) -> Dict[str, Any]:
+        if file_hash in self._mem:
+            return self._mem[file_hash]
+        data: Dict[str, Any] = {}
+        path = self._path(file_hash)
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("OCR önbelleği okunamadı (%s): %s", file_hash, exc)
+                data = {}
+        self._mem[file_hash] = data
+        return data
+
+    @staticmethod
+    def page_key(page: int, dpi: int, engine: str, languages, policy: str) -> str:
+        langs = ",".join(languages) if not isinstance(languages, str) else languages
+        return f"p{page}|dpi{dpi}|{engine}|{langs}|{policy}"
+
+    def get(self, file_hash: str, key: str) -> Optional[Dict[str, Any]]:
+        return self._file_map(file_hash).get(key)
+
+    def put(self, file_hash: str, key: str, value: Dict[str, Any]) -> None:
+        self._file_map(file_hash)[key] = value
+
+    def flush(self, file_hash: str) -> None:
+        """Bir dosyanın önbelleğini diske yazar."""
+        try:
+            with open(self._path(file_hash), "w", encoding="utf-8") as fh:
+                json.dump(self._mem.get(file_hash, {}), fh, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("OCR önbelleği yazılamadı (%s): %s", file_hash, exc)
+
+
 def _score_ocr_result(result: Any, text: str) -> float:
     """
     Bir OCR sonucunu puanlar (rotasyon seçimi için). Güven skorları varsa
@@ -207,20 +309,38 @@ def clean_ocr_text(text: str) -> str:
 # ===========================================================================
 def format_ingestion_report(stats: Dict[str, Any]) -> str:
     """Bir içe aktarım (ingestion) istatistik sözlüğünü okunaklı rapora çevirir."""
-    failed = stats.get("failed_pages") or []
+    def g(key, default=0):
+        return stats.get(key, default)
+    failed = g("failed_pages", []) or []
+    # Per-dosya raporu 'dominant_rotation' (açı), toplulaştırılmış rapor
+    # 'dominant_rotation_files' (kaç dosyada dominant belirlendi) taşır.
+    dom = g("dominant_rotation", None)
+    dom_files = g("dominant_rotation_files", None)
     lines = [
         "=== INGESTION RAPORU ===",
-        f"  Kaynak              : {stats.get('source', '-')}",
-        f"  Toplam sayfa        : {stats.get('total_pages', 0)}",
-        f"  Metin cikan sayfa   : {stats.get('pages_with_text', 0)}",
-        f"  OCR kullanilan sayfa: {stats.get('ocr_pages', 0)}",
-        f"  Toplam karakter     : {stats.get('total_chars', 0)}",
-        f"  Toplam chunk        : {stats.get('total_chunks', 0)}",
-        f"  OCR suresi          : {stats.get('ocr_time', 0)} sn",
-        f"  Embedding suresi    : {stats.get('embedding_time', 0)} sn",
-        f"  Chroma yazma suresi : {stats.get('chroma_write_time', 0)} sn",
-        f"  Basarisiz sayfa     : {len(failed)}" + (f" -> {failed}" if failed else ""),
+        f"  Kaynak                : {g('source', '-')}",
+        f"  Toplam dosya          : {g('total_files', 1)}",
+        f"  Toplam sayfa          : {g('total_pages')}",
+        f"  Metin katmanli sayfa  : {g('text_layer_pages')}",
+        f"  OCR gereken sayfa     : {g('ocr_required_pages')}",
+        f"  OCR sonucu kullanilan : {g('ocr_used_pages')}  (cache dahil)",
+        f"  Gercek OCR calisan    : {g('ocr_executed_pages')}  (cache haric)",
+        f"  Onbellek (cache) hit  : {g('cache_hit_pages')}",
+        f"  OCR atlanan sayfa     : {g('ocr_skipped_pages')}",
+        f"  Cizim atlanan sayfa   : {g('drawing_skipped_pages')}",
+        f"  Fallback yapilan sayfa: {g('fallback_pages')}",
+        f"  Toplam OCR cagrisi    : {g('total_ocr_calls')}",
+        f"  Toplam chunk          : {g('total_chunks')}",
+        f"  Metin cikarma suresi  : {g('text_time')} sn",
+        f"  OCR suresi            : {g('ocr_time')} sn",
+        f"  Embedding suresi      : {g('embedding_time')} sn",
+        f"  Chroma yazma suresi   : {g('chroma_time')} sn",
+        f"  Basarisiz sayfa       : {len(failed)}" + (f" -> {failed[:20]}" if failed else ""),
     ]
+    if dom is not None:
+        lines.append(f"  Dominant rotasyon     : {dom} derece")
+    if dom_files is not None:
+        lines.append(f"  Dominant rotasyonlu dosya: {dom_files}")
     return "\n".join(lines)
 
 
@@ -264,22 +384,23 @@ class DocumentProcessor:
     # Daha azı çıkarsa sayfa "taranmış (scanned)" kabul edilip OCR'a yönlendirilir.
     MIN_TEXT_THRESHOLD = 20
 
-    # Rotasyon denemesinde İLK denenen açı (0 veya dominant) bu kadar metin
-    # verdiyse diğer açıları DENEME (gereksiz 4x OCR'dan kaçınılır).
+    # Rotasyon denemesinde İLK denenen açı (0 veya dominant) bu kadar ANLAMLI
+    # metin verdiyse diğer açıları DENEME (gereksiz 4x OCR'dan kaçınılır).
     ROT_FASTPATH_CHARS = 240
-    # Dominant açı belge için zaten DOĞRU bilindiğinden, az da olsa gerçek metin
-    # verdiyse ona güveniriz; diğer açılara yalnızca sonuç bu kadar bile metin
-    # vermezse (sayfa yanlış yönde veya boş) düşeriz. Düşük eşik = bulk sayfalarda
-    # tek OCR çağrısı = hız.
-    ROT_ACCEPT_MIN = 25
+    # Dominant açı belge için DOĞRU bilindiğinden, az da olsa anlamlı metin
+    # (meaningful_score) verdiyse ona güveniriz; sadece neredeyse boş/gürültüyse
+    # diğer açılara düşeriz. Düşük eşik = bulk sayfalarda tek OCR çağrısı = hız.
+    ROT_ACCEPT_MIN = 20
     # Bir sayfanın dominant rotasyon TESPİTİNE katkı sayılması için (güvenilir
-    # sinyal) gereken en az metin. Tespit eşiği kabul eşiğinden yüksek tutulur.
-    ROT_PREFERRED_MIN = 80
+    # sinyal) gereken en az ANLAMLI metin. Kabul eşiğinden yüksek tutulur.
+    ROT_PREFERRED_MIN = 60
 
-    # Belge-geneli dominant rotasyon tespiti: ilk bu kadar METİNLİ sayfa tüm
-    # açılarda taranır; sonra dominant açı belirlenip kalan sayfalarda önce o
-    # denenir (zayıf çıkarsa diğerlerine fallback). Tüm sayfaları 4x taramaktan
-    # çok daha hızlıdır.
+    # Dominant rotasyon tespiti yalnızca OCR gereken sayfa sayısı bu eşiği
+    # aşarsa yapılır (az sayfalı dosyada probe maliyeti anlamsız).
+    DOMINANT_MIN_PAGES = 8
+
+    # Belge-geneli dominant rotasyon tespiti: ilk bu kadar GÜVENİLİR metinli sayfa
+    # tüm açılarda taranır; sonra dominant açı belirlenir.
     ROT_PROBE_PAGES = 5   # En fazla bu kadar sayfa tam taranır.
     ROT_PROBE_MIN = 3     # Bu kadar prob sonrası net çoğunluk varsa erken karar.
 
@@ -298,32 +419,49 @@ class DocumentProcessor:
         ocr_languages: Optional[List[str]] = None,
         enable_pdf_ocr_fallback: bool = True,
         ocr_gpu: Optional[bool] = None,
-        ocr_dpi: int = 300,
+        ingest_mode: str = DEFAULT_INGEST_MODE,
+        ocr_dpi: Optional[int] = None,
+        skip_drawings: Optional[bool] = None,
         min_chunk_chars: int = 60,
         try_rotations: bool = True,
+        cache_dir: Optional[str] = None,
+        force_reocr: bool = False,
         debug_dir: Optional[str] = None,
+        drawings_dir: Optional[str] = None,
     ) -> None:
         """
-        :param chunk_size: Her metin parçasının maksimum karakter uzunluğu.
-        :param chunk_overlap: Bağlamı korumak için parçalar arası örtüşme miktarı.
-        :param ocr_languages: OCR dilleri (varsayılan: Türkçe + İngilizce).
-        :param enable_pdf_ocr_fallback: Metinsiz PDF sayfalarında OCR denensin mi?
-        :param ocr_gpu: OCR için GPU? None ise otomatik (CUDA'lı torch varsa GPU).
-        :param ocr_dpi: Taranmış sayfaların OCR için render DPI'ı (200-300 önerilir).
-        :param min_chunk_chars: Bir parçanın korunması için en az karakter (50-100).
-        :param try_rotations: Taranmış sayfalarda 0/90/180/270 rotasyon denensin mi?
-        :param debug_dir: Verilirse, sayfa başına OCR metni 'debug_ocr/' altına,
-                          boş sayfaların görüntüsü 'debug_failed_pages/' altına yazılır.
+        :param ingest_mode: 'fast' | 'balanced' | 'full' (varsayılan balanced).
+                            ocr_dpi ve skip_drawings için varsayılanları belirler.
+        :param ocr_dpi: Render DPI'ı; None ise moda göre (fast 150 / balanced 200 /
+                        full 300). Açıkça verilirse modu override eder.
+        :param skip_drawings: Çizim/şema dosyalarında OCR atlansın mı? None ise
+                              moda göre (fast/balanced True, full False).
+        :param cache_dir: Verilirse sayfa-bazlı OCR önbelleği kullanılır (2. çalıştırma
+                          çok hızlı). force_reocr ile bypass edilebilir.
+        :param force_reocr: True ise önbellek okunmaz (yine de güncellenir).
+        :param debug_dir: Sayfa OCR metni/boş sayfa görüntüsü buraya yazılır.
+        :param drawings_dir: Atlanan çizim sayfalarının görüntüleri buraya kaydedilir.
         """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.ocr_languages = ocr_languages or ["tr", "en"]
         self.enable_pdf_ocr_fallback = enable_pdf_ocr_fallback
         self._ocr_gpu = ocr_gpu  # None = otomatik
-        self.ocr_dpi = max(72, int(ocr_dpi))
+
+        mode = ingest_mode if ingest_mode in INGEST_MODES else DEFAULT_INGEST_MODE
+        self.ingest_mode = mode
+        defaults = INGEST_MODES[mode]
+        self.ocr_dpi = max(72, int(ocr_dpi if ocr_dpi is not None else defaults["ocr_dpi"]))
+        self.skip_drawings = (defaults["skip_drawings"] if skip_drawings is None
+                              else bool(skip_drawings))
+
         self.min_chunk_chars = max(1, int(min_chunk_chars))
         self.try_rotations = try_rotations
+        self.force_reocr = force_reocr
         self.debug_dir = debug_dir
+        self.drawings_dir = drawings_dir
+        self._cache = OcrCache(cache_dir) if cache_dir else None
+        self.ocr_engine = "easyocr"
 
         # OCR motoru ilk kullanımda yüklenecek (lazy).
         self._ocr_reader = None
@@ -415,7 +553,15 @@ class DocumentProcessor:
     #  PDF İşleme
     # ------------------------------------------------------------------ #
     def _process_pdf(self, file_path: str) -> ProcessResult:
-        """PDF'ten metin çıkarır; metinsiz sayfalarda rotasyon-bilinçli OCR'a düşer."""
+        """PDF'ten metin çıkarır; metinsiz sayfalarda rotasyon-bilinçli OCR'a düşer.
+
+        Mod/cache/çizim-atlama kuralları:
+          * Metin katmanı olan sayfalar doğrudan kullanılır (OCR yok).
+          * Metinsiz sayfalar OCR'a gider. Çizim/şema dosyalarında (skip_drawings)
+            OCR ATLANIR; sayfa görüntüsü/metadata saklanır ama Chroma'ya eklenmez.
+          * cache_dir varsa OCR sonucu sayfa-bazlı önbelleğe alınır (2. çalıştırma hızlı).
+          * Dominant rotasyon yalnızca OCR gereken sayfa >= DOMINANT_MIN_PAGES ise.
+        """
         if fitz is None:
             return ProcessResult(
                 success=False,
@@ -423,12 +569,22 @@ class DocumentProcessor:
             )
 
         source = os.path.basename(file_path)
+        # Çizim tespiti tüm yol (klasör adları dahil) üzerinden; ör. 'Diagrams/...'
+        normalized_path = file_path.replace("\\", "/")
+        is_drawing = self.skip_drawings and is_drawing_file(normalized_path)
+        # file_hash her zaman hesaplanır (cache + çizim görüntü klasörü için).
+        file_hash = file_signature(file_path)
+        rotation_policy = ("smart" if self.try_rotations else "fixed0")
+
         all_chunks: List[DocumentChunk] = []
-        ocr_pages = 0
-        pages_with_text = 0
-        total_chars = 0
-        ocr_time = 0.0
-        failed_pages: List[int] = []
+        st = {
+            "source": source, "total_pages": 0, "text_layer_pages": 0,
+            "ocr_required_pages": 0, "ocr_used_pages": 0, "ocr_executed_pages": 0,
+            "ocr_skipped_pages": 0, "drawing_skipped_pages": 0, "cache_hit_pages": 0,
+            "failed_pages": [], "total_chunks": 0, "total_chars": 0,
+            "text_time": 0.0, "ocr_time": 0.0, "total_ocr_calls": 0,
+            "fallback_pages": 0, "dominant_rotation": None, "is_drawing": is_drawing,
+        }
 
         try:
             document = fitz.open(file_path)
@@ -436,110 +592,177 @@ class DocumentProcessor:
             return ProcessResult(success=False, message=f"PDF açılamadı: {exc}")
 
         total_pages = len(document)
-        # Belge-geneli dominant rotasyon: ilk birkaç metinli sayfadan belirlenir,
-        # sonra kalan sayfalarda önce o denenir (hız için).
+        st["total_pages"] = total_pages
+
+        # Ön tarama: hangi sayfalar metin katmanlı, kaçı OCR gerektiriyor?
+        page_has_text: List[bool] = []
+        for pn in range(total_pages):
+            tl = (document[pn].get_text() or "").strip()
+            page_has_text.append(len(tl) >= self.MIN_TEXT_THRESHOLD)
+        st["ocr_required_pages"] = sum(1 for h in page_has_text if not h)
+        # Dominant rotasyon yalnızca yeterince OCR sayfası varsa anlamlı.
+        use_dominant = (self.try_rotations
+                        and st["ocr_required_pages"] >= self.DOMINANT_MIN_PAGES)
+
         probe_rotations: List[int] = []
         dominant_rotation: Optional[int] = None
         try:
             for page_number in range(total_pages):
                 page = document[page_number]
                 page_label = page_number + 1
-                text_layer = (page.get_text() or "").strip()
-
                 ocr_used = False
                 rotation = 0
-                rendered = None  # OCR'da render edilen numpy görüntü (debug için)
+                rendered = None
+                page_text = ""
 
-                if len(text_layer) >= self.MIN_TEXT_THRESHOLD:
-                    page_text = clean_ocr_text(text_layer)
-                elif self.enable_pdf_ocr_fallback:
+                if page_has_text[page_number]:
                     t0 = time.perf_counter()
-                    rendered = self._render_page_array(page)
-                    best = self._ocr_image_best(
-                        rendered, f"page_{page_label:03d}", preferred=dominant_rotation
-                    )
-                    ocr_time += time.perf_counter() - t0
-                    page_text = clean_ocr_text(best["text"])
-                    ocr_used = True
-                    rotation = best["rotation"]
-                    ocr_pages += 1
-                    logger.info(
-                        "page=%d best_rotation=%d text_len=%d score=%.0f%s",
-                        page_label, rotation, len(page_text), best["score"],
-                        " (dominant)" if dominant_rotation is not None else " (probe)",
-                    )
-                    # Dominant henüz belirlenmediyse, GÜVENİLİR metinli sayfalarla
-                    # tespit et (anlamlı karakter yüksek eşik = sağlam sinyal).
-                    if dominant_rotation is None and meaningful_len(best["text"]) >= self.ROT_PREFERRED_MIN:
-                        probe_rotations.append(rotation)
-                        if (len(probe_rotations) >= self.ROT_PROBE_PAGES
-                                or self._rotation_decided(probe_rotations, self.ROT_PROBE_MIN)):
-                            dominant_rotation = Counter(probe_rotations).most_common(1)[0][0]
-                            logger.info(
-                                "Dokuman dominant rotasyonu: %d derece (problar: %s)",
-                                dominant_rotation, probe_rotations,
-                            )
-                else:
+                    page_text = clean_ocr_text((page.get_text() or "").strip())
+                    st["text_layer_pages"] += 1
+                    st["text_time"] += time.perf_counter() - t0
+                elif not self.enable_pdf_ocr_fallback:
                     page_text = ""
+                elif is_drawing:
+                    # Çizim/şema: OCR'ı atla; görüntüyü (file_hash klasöründe) sakla,
+                    # metadata'yı drawings_index.jsonl'a yaz, Chroma'ya EKLEME.
+                    st["drawing_skipped_pages"] += 1
+                    st["ocr_skipped_pages"] += 1
+                    image_path = ""
+                    if self.drawings_dir and Image is not None:
+                        try:
+                            rendered = self._render_page_array(page)
+                            ddir = os.path.join(self.drawings_dir, file_hash)
+                            os.makedirs(ddir, exist_ok=True)
+                            image_path = os.path.join(ddir, f"page_{page_label:03d}.png")
+                            Image.fromarray(rendered).save(image_path)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("Çizim görüntüsü kaydedilemedi: %s", exc)
+                            image_path = ""
+                    self._append_drawings_index({
+                        "source_file": source, "page": page_label,
+                        "page_type": "drawing", "ocr_skipped": True,
+                        "reason": "drawing_filename_match",
+                        "image_path": image_path,
+                    })
+                    continue  # bu sayfadan chunk üretme
+                else:
+                    # --- OCR (önbellek + rotasyon) ---
+                    cache_key = None
+                    cached = None
+                    if self._cache and not self.force_reocr:
+                        cache_key = OcrCache.page_key(
+                            page_label, self.ocr_dpi, self.ocr_engine,
+                            self.ocr_languages, rotation_policy)
+                        cached = self._cache.get(file_hash, cache_key)
 
-                # Debug: sayfa metnini yaz (varsa); boşsa görüntüyü kaydet.
+                    if cached is not None:
+                        page_text = cached.get("text", "")
+                        rotation = int(cached.get("rotation", 0))
+                        ocr_used = True
+                        st["cache_hit_pages"] += 1
+                        st["ocr_used_pages"] += 1  # OCR sonucu kullanıldı (cache'ten)
+                        # Önbellekten gelen sayfa da dominant rotasyon kararına katkı verir.
+                        if (use_dominant and dominant_rotation is None
+                                and meaningful_score(page_text) >= self.ROT_PREFERRED_MIN):
+                            probe_rotations.append(rotation)
+                            if (len(probe_rotations) >= self.ROT_PROBE_PAGES
+                                    or self._rotation_decided(probe_rotations, self.ROT_PROBE_MIN)):
+                                dominant_rotation = Counter(probe_rotations).most_common(1)[0][0]
+                                st["dominant_rotation"] = dominant_rotation
+                                logger.info(
+                                    "Dokuman dominant rotasyonu (cache): %d derece (problar: %s)",
+                                    dominant_rotation, probe_rotations)
+                    else:
+                        t0 = time.perf_counter()
+                        rendered = self._render_page_array(page)
+                        best = self._ocr_image_best(
+                            rendered, f"page_{page_label:03d}",
+                            preferred=dominant_rotation if use_dominant else None)
+                        st["ocr_time"] += time.perf_counter() - t0
+                        page_text = clean_ocr_text(best["text"])
+                        rotation = best["rotation"]
+                        ocr_used = True
+                        st["ocr_used_pages"] += 1       # OCR sonucu kullanıldı
+                        st["ocr_executed_pages"] += 1   # gerçekten OCR çalıştı (cache değil)
+                        st["total_ocr_calls"] += best.get("calls", 1)
+                        if best.get("fell_back"):
+                            st["fallback_pages"] += 1
+                        logger.info(
+                            "page=%d best_rotation=%d text_len=%d score=%.0f%s",
+                            page_label, rotation, len(page_text), best["score"],
+                            " (dominant)" if (use_dominant and dominant_rotation is not None)
+                            else " (probe)",
+                        )
+                        # Önbelleğe yaz (force_reocr olsa da güncelle).
+                        if self._cache:
+                            ck = cache_key or OcrCache.page_key(
+                                page_label, self.ocr_dpi, self.ocr_engine,
+                                self.ocr_languages, rotation_policy)
+                            self._cache.put(file_hash, ck,
+                                            {"text": page_text, "rotation": rotation})
+                        # Dominant rotasyon tespiti (güvenilir metinli sayfalarla).
+                        if (use_dominant and dominant_rotation is None
+                                and meaningful_score(best["text"]) >= self.ROT_PREFERRED_MIN):
+                            probe_rotations.append(rotation)
+                            if (len(probe_rotations) >= self.ROT_PROBE_PAGES
+                                    or self._rotation_decided(probe_rotations, self.ROT_PROBE_MIN)):
+                                dominant_rotation = Counter(probe_rotations).most_common(1)[0][0]
+                                st["dominant_rotation"] = dominant_rotation
+                                logger.info(
+                                    "Dokuman dominant rotasyonu: %d derece (problar: %s)",
+                                    dominant_rotation, probe_rotations)
+
+                # Debug çıktısı (OCR'lı/boş sayfalar için).
                 self._write_page_debug(page_label, page_text, rendered)
 
                 if page_text:
-                    pages_with_text += 1
-                    total_chars += len(page_text)
+                    st["total_chars"] += len(page_text)
                     pieces = self._split_text(page_text)
                     if not pieces:
-                        # OCR metin üretti ama chunker 0 üretti -> bug. Logla + kurtar.
                         logger.warning(
                             "WARNING: OCR produced text but chunker produced 0 chunks "
-                            "(page=%d, chars=%d).", page_label, len(page_text)
-                        )
-                        pieces = [page_text]  # Veriyi kaybetme.
+                            "(page=%d, chars=%d).", page_label, len(page_text))
+                        pieces = [page_text]
                     for idx, piece in enumerate(pieces):
                         all_chunks.append(DocumentChunk(
                             text=piece, source=source, page=page_label,
                             chunk_index=idx, ocr_used=ocr_used,
-                            rotation=rotation, char_count=len(piece),
-                        ))
-                else:
-                    failed_pages.append(page_label)
+                            rotation=rotation, char_count=len(piece)))
+                elif ocr_used:
+                    st["failed_pages"].append(page_label)
         finally:
             document.close()
+            if self._cache and file_hash:
+                self._cache.flush(file_hash)
 
-        stats = {
-            "source": source,
-            "total_pages": total_pages,
-            "pages_with_text": pages_with_text,
-            "ocr_pages": ocr_pages,
-            "total_chars": total_chars,
-            "total_chunks": len(all_chunks),
-            "ocr_time": round(ocr_time, 2),
-            "failed_pages": failed_pages,
-        }
+        st["total_chunks"] = len(all_chunks)
+        st["text_time"] = round(st["text_time"], 2)
+        st["ocr_time"] = round(st["ocr_time"], 2)
 
-        if total_chars > 0 and not all_chunks:
-            # Bu noktaya normalde gelinmez (kurtarma var); yine de açıkça hata say.
+        if st["total_chars"] > 0 and not all_chunks:
             logger.warning(
-                "WARNING: OCR produced text but chunker produced 0 chunks (%s).", source
-            )
+                "WARNING: OCR produced text but chunker produced 0 chunks (%s).", source)
 
         if not all_chunks:
-            if total_chars == 0:
+            if is_drawing:
+                msg = (f"'{source}': çizim/şema dosyası — OCR atlandı "
+                       f"({st['drawing_skipped_pages']} sayfa).")
+                return ProcessResult(success=True, message=msg, stats=st)  # hata değil
+            if st["total_chars"] == 0:
                 msg = (f"'{source}': hiçbir sayfadan metin çıkarılamadı "
-                       f"({len(failed_pages)}/{total_pages} sayfa boş).")
-                if self.debug_dir:
-                    msg += f" Görseller '{self._failed_dir()}' altına kaydedildi."
+                       f"({len(st['failed_pages'])}/{total_pages} sayfa boş).")
             else:
                 msg = f"'{source}': metin çıktı ama parça üretilemedi (chunker hatası)."
-            return ProcessResult(success=False, message=msg, stats=stats)
+            return ProcessResult(success=False, message=msg, stats=st)
 
         msg = f"'{source}' işlendi: {len(all_chunks)} parça."
-        if ocr_pages:
-            msg += f" ({ocr_pages} sayfa OCR ile okundu.)"
-        if failed_pages:
-            msg += f" {len(failed_pages)} sayfa boş kaldı."
-        return ProcessResult(chunks=all_chunks, success=True, message=msg, stats=stats)
+        if st["ocr_used_pages"]:
+            msg += (f" ({st['ocr_used_pages']} OCR"
+                    + (f", {st['cache_hit_pages']} önbellek" if st['cache_hit_pages'] else "")
+                    + " sayfa.)")
+        if st["failed_pages"]:
+            msg += f" {len(st['failed_pages'])} sayfa boş."
+        return ProcessResult(chunks=all_chunks, success=True, message=msg, stats=st)
 
     def _render_page_array(self, page):
         """PDF sayfasını ocr_dpi çözünürlükte numpy RGB diziye render eder."""
@@ -586,25 +809,33 @@ class DocumentProcessor:
           erken durulur).
         """
         if not self.try_rotations:
-            return self._ocr_at_angle(arr, 0, label)
+            res = self._ocr_at_angle(arr, 0, label)
+            res["calls"] = 1
+            res["fell_back"] = False
+            return res
 
         order = [0, 90, 180, 270]
         if preferred is not None:
             order = [preferred] + [a for a in order if a != preferred]
 
         best: Dict[str, Any] = {"text": "", "rotation": 0, "score": -1.0}
+        calls = 0
         for i, angle in enumerate(order):
             cur = self._ocr_at_angle(arr, angle, label)
+            calls += 1
             if cur["score"] > best["score"]:
                 best = cur
             if i == 0:
                 # İlk denenen açı (0 veya dominant) zaten güçlüyse: bitir.
-                if meaningful_len(cur["text"]) >= self.ROT_FASTPATH_CHARS:
+                if meaningful_score(cur["text"]) >= self.ROT_FASTPATH_CHARS:
                     break
                 # Dominant açı (doğru bilinen) az da olsa ANLAMLI metin verdiyse
                 # güven; sadece neredeyse boş veya saf gürültüyse diğerlerine düş.
-                if preferred is not None and meaningful_len(cur["text"]) >= self.ROT_ACCEPT_MIN:
+                if preferred is not None and meaningful_score(cur["text"]) >= self.ROT_ACCEPT_MIN:
                     break
+        best["calls"] = calls
+        # Tercih edilen açı verildiyse ve birden fazla açı denendiyse: fallback oldu.
+        best["fell_back"] = preferred is not None and calls > 1
         return best
 
     @staticmethod
@@ -633,12 +864,18 @@ class DocumentProcessor:
         except Exception as exc:  # noqa: BLE001
             return ProcessResult(success=False, message=f"Görsel OCR hatası: {exc}")
 
+        base = {"source": source, "total_pages": 1, "text_layer_pages": 0,
+                "ocr_required_pages": 1, "ocr_used_pages": 1, "ocr_executed_pages": 1,
+                "ocr_skipped_pages": 0, "drawing_skipped_pages": 0, "cache_hit_pages": 0,
+                "total_ocr_calls": best.get("calls", 1),
+                "fallback_pages": 1 if best.get("fell_back") else 0,
+                "ocr_time": 0.0, "text_time": 0.0, "dominant_rotation": None}
+
         if not text:
+            base.update({"total_chars": 0, "total_chunks": 0, "failed_pages": [1]})
             return ProcessResult(
                 success=False, message=f"'{source}' görselinde metin bulunamadı.",
-                stats={"source": source, "total_pages": 1, "pages_with_text": 0,
-                       "ocr_pages": 1, "total_chars": 0, "total_chunks": 0,
-                       "failed_pages": [1]},
+                stats=base,
             )
 
         pieces = self._split_text(text) or [text]
@@ -647,12 +884,11 @@ class DocumentProcessor:
                           ocr_used=True, rotation=best["rotation"], char_count=len(piece))
             for idx, piece in enumerate(pieces)
         ]
-        stats = {"source": source, "total_pages": 1, "pages_with_text": 1,
-                 "ocr_pages": 1, "total_chars": len(text), "total_chunks": len(chunks),
-                 "failed_pages": []}
+        base.update({"total_chars": len(text), "total_chunks": len(chunks),
+                     "failed_pages": []})
         return ProcessResult(
             chunks=chunks, success=True,
-            message=f"'{source}' OCR ile okundu: {len(chunks)} parça.", stats=stats,
+            message=f"'{source}' OCR ile okundu: {len(chunks)} parça.", stats=base,
         )
 
     # ------------------------------------------------------------------ #
@@ -690,6 +926,28 @@ class DocumentProcessor:
         if letters / len(t) < self.MIN_ALPHA_RATIO:
             return True
         return False
+
+    # ------------------------------------------------------------------ #
+    #  Çizim Atlama İndeksi
+    # ------------------------------------------------------------------ #
+    def _drawings_index_path(self) -> str:
+        """drawings_index.jsonl için yazılacak yol (uygun bir taban klasör seçer)."""
+        base = self.drawings_dir or self.debug_dir
+        if not base and self._cache:
+            base = os.path.dirname(os.path.normpath(self._cache.cache_dir))
+        if not base:
+            base = os.getcwd()
+        return os.path.join(base, "drawings_index.jsonl")
+
+    def _append_drawings_index(self, entry: Dict[str, Any]) -> None:
+        """Atlanan bir çizim sayfasının metadata'sını drawings_index.jsonl'a ekler."""
+        try:
+            path = self._drawings_index_path()
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("drawings_index yazılamadı: %s", exc)
 
     # ------------------------------------------------------------------ #
     #  Debug Çıktısı

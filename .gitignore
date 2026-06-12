@@ -30,6 +30,7 @@ installer_output/
 # OCR tanılama (debug) çıktıları
 debug_ocr/
 debug_failed_pages/
+drawings_index.jsonl
 
 # IDE / editör
 .vscode/
