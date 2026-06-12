@@ -490,11 +490,13 @@ class ModelsView(ctk.CTkFrame):
 # ---------------------------------------------------------------------------
 class DownloadsView(ctk.CTkFrame):
     """
-    Tüm model kataloğunu (indirilmiş + indirilebilir) listeleyen ayrı görünüm.
-    Her satırda modelin boyutu/açıklaması ve durumuna göre 'İndir' veya 'Sil'
-    düğmesi bulunur. Başka bilgisayarlara kurulumda hangi modellerin mevcut
-    olduğunu görüp indirmek için tasarlanmıştır. Sağlayıcı seçiminden bağımsız
-    olarak her zaman erişilebilir.
+    Model indirme merkezi. Üç yol sunar:
+      * Önerilenler: elle seçilmiş, Türkçe-yetkin hızlı seçim listesi.
+      * Arama: Hugging Face'te GGUF modellerini isimle arayıp repodaki bir
+        quantization dosyasını seçerek indirme (tüm güncel modellere erişim).
+      * Manuel: repo_id ve dosya adını doğrudan yazarak indirme.
+    İndirilen modeller çevrimdışı kullanılabilir ve 'Modeller' sekmesinden aktif
+    model olarak seçilir. Sağlayıcı seçiminden bağımsız her zaman erişilebilir.
     """
 
     def __init__(
@@ -503,16 +505,30 @@ class DownloadsView(ctk.CTkFrame):
         on_download: Callable[[Dict], None],
         on_cancel_download: Callable[[], None],
         on_delete_model: Callable[[str], None],
+        on_search: Callable[[str], None],
+        on_select_repo: Callable[[str], None],
         **kwargs,
     ) -> None:
         super().__init__(master, corner_radius=0, **kwargs)
         self._on_download = on_download
         self._on_cancel_download = on_cancel_download
         self._on_delete_model = on_delete_model
-        self._curated_rows: List[ctk.CTkBaseClass] = []
+        self._on_search = on_search
+        self._on_select_repo = on_select_repo
+
+        # Görünüm durumu ve önbellek.
+        self._mode = "curated"        # "curated" | "search" | "files"
+        self._loading = False
+        self._curated: List[Dict] = []
+        self._downloaded: List[str] = []
+        self._search_results: List[Dict] = []
+        self._search_title = "Arama sonuçları (Hugging Face)"
+        self._repo_files: List[Dict] = []
+        self._current_repo: Optional[str] = None
+        self._rows: List[ctk.CTkBaseClass] = []
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(4, weight=1)
 
         ctk.CTkLabel(
             self, text="İndirilenler",
@@ -521,19 +537,81 @@ class DownloadsView(ctk.CTkFrame):
 
         ctk.CTkLabel(
             self,
-            text="Tüm modeller aşağıda listelenir. İndirilen modeller çevrimdışı "
-                 "kullanılabilir ve 'Modeller' sekmesinden aktif model olarak "
-                 "seçilebilir. İndirilen '.gguf' dosyalarını başka bir bilgisayarın "
-                 "aynı klasörüne kopyalayarak da taşıyabilirsiniz.",
+            text="Önerilen modelleri tek tıkla indirin ya da Hugging Face'te "
+                 "arayarak/elle girerek tüm güncel modellere erişin. İndirme "
+                 "anında internet gerekir; indirildikten sonra kullanım "
+                 "çevrimdışıdır. '.gguf' dosyaları başka bir bilgisayarın aynı "
+                 "klasörüne kopyalanarak da taşınabilir.",
             font=ctk.CTkFont(size=12), text_color="gray60", anchor="w",
             justify="left", wraplength=620,
         ).grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
 
-        self.curated_frame = ctk.CTkScrollableFrame(
-            self, label_text="Model Kataloğu", fg_color="transparent"
+        # --- Arama satırı ---
+        search_frame = ctk.CTkFrame(self, fg_color="transparent")
+        search_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 6))
+        search_frame.grid_columnconfigure(0, weight=1)
+        self.search_entry = ctk.CTkEntry(
+            search_frame,
+            placeholder_text="Hugging Face'te model ara (ör. qwen3, llama 3.3, phi-4)",
+            height=38,
         )
-        self.curated_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
-        self.curated_frame.grid_columnconfigure(0, weight=1)
+        self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.search_entry.bind("<Return>", lambda _e: self._handle_search())
+        self.search_btn = ctk.CTkButton(
+            search_frame, text="Ara", width=80, height=38, command=self._handle_search,
+        )
+        self.search_btn.grid(row=0, column=1, padx=(0, 6))
+        self.browse_btn = ctk.CTkButton(
+            search_frame, text="Tüm modeller", width=120, height=38,
+            command=self._handle_browse,
+        )
+        self.browse_btn.grid(row=0, column=2, padx=(0, 6))
+        self.curated_btn = ctk.CTkButton(
+            search_frame, text="Önerilenler", width=110, height=38,
+            fg_color="transparent", border_width=1, command=self.show_curated,
+        )
+        self.curated_btn.grid(row=0, column=3)
+
+        # --- Bağlam başlığı + geri düğmesi ---
+        head_frame = ctk.CTkFrame(self, fg_color="transparent")
+        head_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 2))
+        head_frame.grid_columnconfigure(0, weight=1)
+        self.context_label = ctk.CTkLabel(
+            head_frame, text="", font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        )
+        self.context_label.grid(row=0, column=0, sticky="ew")
+        self.back_btn = ctk.CTkButton(
+            head_frame, text="← Geri", width=90, height=28,
+            fg_color="transparent", border_width=1,
+            command=self._handle_back,
+        )
+        # back_btn yalnızca repo dosya listesindeyken görünür.
+
+        # --- Sonuç listesi (curated/arama/dosyalar ortak alan) ---
+        self.list_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.list_frame.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0, 6))
+        self.list_frame.grid_columnconfigure(0, weight=1)
+
+        # --- Manuel giriş ---
+        manual = ctk.CTkFrame(self, fg_color=COLOR_INFO, corner_radius=8)
+        manual.grid(row=5, column=0, sticky="ew", padx=20, pady=(0, 6))
+        manual.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkLabel(
+            manual, text="Manuel indirme (repo kimliği ve dosya adı):",
+            font=ctk.CTkFont(size=12, weight="bold"), anchor="w",
+        ).grid(row=0, column=0, columnspan=3, sticky="ew", padx=10, pady=(8, 2))
+        self.manual_repo = ctk.CTkEntry(
+            manual, placeholder_text="repo_id (ör. bartowski/Qwen2.5-7B-Instruct-GGUF)",
+        )
+        self.manual_repo.grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 8))
+        self.manual_file = ctk.CTkEntry(
+            manual, placeholder_text="dosya adı (ör. Qwen2.5-7B-Instruct-Q4_K_M.gguf)",
+        )
+        self.manual_file.grid(row=1, column=1, sticky="ew", padx=4, pady=(0, 8))
+        self.manual_btn = ctk.CTkButton(
+            manual, text="İndir", width=90, command=self._handle_manual,
+        )
+        self.manual_btn.grid(row=1, column=2, padx=(4, 10), pady=(0, 8))
 
         # --- İndirme ilerleme alanı ---
         self.progress_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -553,45 +631,235 @@ class DownloadsView(ctk.CTkFrame):
         )
         self.cancel_btn.grid(row=0, column=1)
 
-    # -- Katalog ----------------------------------------------------------- #
-    def set_curated(self, curated: List[Dict], downloaded: List[str]) -> None:
-        """Model satırlarını çizer (durumlarına göre İndir/Sil düğmesi)."""
-        for w in self._curated_rows:
-            w.destroy()
-        self._curated_rows.clear()
+        self._render()
 
-        for i, m in enumerate(curated):
-            is_down = m["filename"] in downloaded
-            row = ctk.CTkFrame(self.curated_frame, fg_color=COLOR_INFO, corner_radius=8)
+    # -- Yardımcılar ------------------------------------------------------- #
+    @staticmethod
+    def _basename(path: str) -> str:
+        return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+    def _is_downloaded(self, filename: str) -> bool:
+        return self._basename(filename) in self._downloaded
+
+    @staticmethod
+    def _fmt_size(num_bytes: Optional[int]) -> str:
+        if not num_bytes:
+            return "boyut bilinmiyor"
+        gb = num_bytes / (1024 ** 3)
+        if gb >= 1:
+            return f"~{gb:.1f} GB"
+        return f"~{num_bytes / (1024 ** 2):.0f} MB"
+
+    def _clear_rows(self) -> None:
+        for w in self._rows:
+            w.destroy()
+        self._rows.clear()
+
+    def _info_label(self, text: str) -> None:
+        lbl = ctk.CTkLabel(
+            self.list_frame, text=text, font=ctk.CTkFont(size=12),
+            text_color="gray60", anchor="w", justify="left", wraplength=560,
+        )
+        lbl.grid(row=0, column=0, sticky="ew", pady=8, padx=4)
+        self._rows.append(lbl)
+
+    # -- Olay işleyiciler -------------------------------------------------- #
+    def _handle_search(self) -> None:
+        query = self.search_entry.get().strip()
+        if query and self._on_search:
+            self._on_search(query)
+
+    def _handle_browse(self) -> None:
+        """Arama terimi olmadan en popüler GGUF modellerini listeler."""
+        self.search_entry.delete(0, "end")
+        if self._on_search:
+            self._on_search("")
+
+    def _handle_back(self) -> None:
+        # Repo dosya listesinden arama sonuçlarına dön.
+        self._mode = "search"
+        self._loading = False
+        self._render()
+
+    def _handle_manual(self) -> None:
+        repo_id = self.manual_repo.get().strip()
+        filename = self.manual_file.get().strip()
+        if not repo_id or not filename:
+            return
+        self._on_download({
+            "repo_id": repo_id, "filename": filename,
+            "label": filename, "approx_mb": 0,
+        })
+
+    # -- Görünüm geçişleri (main.py çağırır) ------------------------------ #
+    def set_curated(self, curated: List[Dict], downloaded: List[str]) -> None:
+        """Önerilen liste ve indirilmiş model durumunu günceller."""
+        self._curated = curated
+        self._downloaded = downloaded
+        self._render()  # mevcut moddaki indirilmiş/indirilmedi durumlarını tazeler.
+
+    def show_curated(self) -> None:
+        self._mode = "curated"
+        self._loading = False
+        self._render()
+
+    def begin_search(self, title: str = "Arama sonuçları (Hugging Face)") -> None:
+        self._mode = "search"
+        self._loading = True
+        self._search_results = []
+        self._search_title = title
+        self._render()
+
+    def set_search_results(self, results: List[Dict],
+                           downloaded: Optional[List[str]] = None) -> None:
+        self._mode = "search"
+        self._loading = False
+        self._search_results = results
+        if downloaded is not None:
+            self._downloaded = downloaded
+        self._render()
+
+    def begin_repo_files(self, repo_id: str) -> None:
+        self._mode = "files"
+        self._loading = True
+        self._current_repo = repo_id
+        self._repo_files = []
+        self._render()
+
+    def set_repo_files(self, repo_id: str, files: List[Dict],
+                       downloaded: Optional[List[str]] = None) -> None:
+        self._mode = "files"
+        self._loading = False
+        self._current_repo = repo_id
+        self._repo_files = files
+        if downloaded is not None:
+            self._downloaded = downloaded
+        self._render()
+
+    # -- Çizim ------------------------------------------------------------- #
+    def _render(self) -> None:
+        self._clear_rows()
+        self.back_btn.grid_forget()
+
+        if self._mode == "curated":
+            self.context_label.configure(text="Önerilen modeller")
+            self._render_curated()
+        elif self._mode == "search":
+            self.context_label.configure(text=self._search_title)
+            if self._loading:
+                self._info_label("Aranıyor...")
+            elif not self._search_results:
+                self._info_label("Sonuç yok. Farklı bir arama deneyin "
+                                 "ya da manuel indirme bölümünü kullanın.")
+            else:
+                self._render_search()
+        elif self._mode == "files":
+            self.context_label.configure(text=f"Repo: {self._current_repo}")
+            self.back_btn.grid(row=0, column=1, sticky="e")
+            if self._loading:
+                self._info_label("Dosyalar getiriliyor...")
+            elif not self._repo_files:
+                self._info_label("Bu repoda .gguf dosyası bulunamadı.")
+            else:
+                self._render_files()
+
+    def _render_curated(self) -> None:
+        for i, m in enumerate(self._curated):
+            is_down = self._is_downloaded(m["filename"])
+            durum = "İndirildi" if is_down else f"~{m['approx_mb'] / 1024:.1f} GB"
+            ram = m.get("min_ram")
+            ram_txt = f" · En az {ram} RAM/VRAM" if ram else ""
+            info = (f"{m['label']}\n{m['params']} · {m['quant']} · "
+                    f"{durum}{ram_txt} — {m['note']}")
+            self._add_row(info, m["filename"], download_payload=m)
+
+    def _render_search(self) -> None:
+        for i, r in enumerate(self._search_results):
+            repo_id = r["repo_id"]
+            info = (f"{repo_id}\n{r.get('downloads', 0):,} indirme · "
+                    f"{r.get('likes', 0)} beğeni").replace(",", ".")
+            row = ctk.CTkFrame(self.list_frame, fg_color=COLOR_INFO, corner_radius=8)
             row.grid(row=i, column=0, sticky="ew", pady=3)
             row.grid_columnconfigure(0, weight=1)
-
-            durum = "İndirildi" if is_down else f"~{m['approx_mb']/1024:.1f} GB"
-            info = (f"{m['label']}\n{m['params']} · {m['quant']} · "
-                    f"{durum} — {m['note']}")
             ctk.CTkLabel(
                 row, text=info, justify="left", anchor="w",
                 font=ctk.CTkFont(size=12), wraplength=480,
             ).grid(row=0, column=0, sticky="ew", padx=10, pady=8)
+            ctk.CTkButton(
+                row, text="Dosyalar", width=90,
+                command=lambda rid=repo_id: self._on_select_repo(rid),
+            ).grid(row=0, column=1, padx=10, pady=8)
+            self._rows.append(row)
 
-            if is_down:
-                btn = ctk.CTkButton(
-                    row, text="Sil", width=90,
-                    fg_color="#8a2c2c", hover_color="#a83232",
-                    command=lambda fn=m["filename"]: self._on_delete_model(fn),
-                )
-            else:
-                btn = ctk.CTkButton(
-                    row, text="İndir", width=90,
-                    command=lambda mm=m: self._on_download(mm),
-                )
-            btn.grid(row=0, column=1, padx=10, pady=8)
-            self._curated_rows.append(row)
+    def _render_files(self) -> None:
+        # Yalnızca tek-dosya, indirilebilir modelleri göster; çok parçalı (split)
+        # ve görsel eki (mmproj) dosyaları gizle.
+        models = [f for f in self._repo_files if f.get("kind", "model") == "model"]
+        hidden = len(self._repo_files) - len(models)
+
+        if not models:
+            self._info_label(
+                "Bu repoda doğrudan indirilebilir tek-dosya model bulunamadı "
+                "(yalnızca çok parçalı veya görsel eki dosyalar var). Farklı bir "
+                "repo deneyin."
+            )
+            return
+
+        for f in models:
+            fname = f["filename"]
+            size = f.get("size")
+            is_down = self._is_downloaded(fname)
+            durum = "İndirildi" if is_down else self._fmt_size(size)
+            quant = f.get("quant", "?")
+            quality = f.get("quality", "")
+            info = f"{self._basename(fname)}\n{quant} · {quality} · {durum}"
+            mb = int(size / (1024 * 1024)) if size else 0
+            payload = {
+                "repo_id": self._current_repo, "filename": fname,
+                "label": self._basename(fname), "approx_mb": mb,
+            }
+            self._add_row(info, fname, download_payload=payload)
+
+        if hidden:
+            note = ctk.CTkLabel(
+                self.list_frame,
+                text=f"{hidden} ek dosya gizlendi (çok parçalı model veya görsel "
+                     f"ekleri — uygulamada kullanılamaz).",
+                font=ctk.CTkFont(size=11), text_color="gray55",
+                anchor="w", justify="left", wraplength=540,
+            )
+            note.grid(row=len(self._rows), column=0, sticky="ew", pady=(6, 2), padx=4)
+            self._rows.append(note)
+
+    def _add_row(self, info: str, filename: str, download_payload: Dict) -> None:
+        """İndir/Sil düğmeli ortak satır (curated ve dosya listeleri için)."""
+        i = len(self._rows)
+        is_down = self._is_downloaded(filename)
+        row = ctk.CTkFrame(self.list_frame, fg_color=COLOR_INFO, corner_radius=8)
+        row.grid(row=i, column=0, sticky="ew", pady=3)
+        row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            row, text=info, justify="left", anchor="w",
+            font=ctk.CTkFont(size=12), wraplength=480,
+        ).grid(row=0, column=0, sticky="ew", padx=10, pady=8)
+        if is_down:
+            btn = ctk.CTkButton(
+                row, text="Sil", width=90,
+                fg_color="#8a2c2c", hover_color="#a83232",
+                command=lambda fn=self._basename(filename): self._on_delete_model(fn),
+            )
+        else:
+            btn = ctk.CTkButton(
+                row, text="İndir", width=90,
+                command=lambda mm=download_payload: self._on_download(mm),
+            )
+        btn.grid(row=0, column=1, padx=10, pady=8)
+        self._rows.append(row)
 
     # -- İndirme ilerleme -------------------------------------------------- #
     def show_progress(self, visible: bool) -> None:
         if visible:
-            self.progress_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+            self.progress_frame.grid(row=6, column=0, sticky="ew", padx=20, pady=(0, 16))
         else:
             self.progress_frame.grid_forget()
 
@@ -607,9 +875,11 @@ class DownloadsView(ctk.CTkFrame):
             )
 
     def set_controls_enabled(self, enabled: bool) -> None:
-        # İndirme satırlarındaki düğmeler set_curated ile yeniden çizilir;
-        # burada özel bir kilitleme gerekmez (meşgulken yeni indirme başlatılmaz).
-        pass
+        """Meşgulken arama ve manuel indirme kontrollerini kilitler."""
+        state = "normal" if enabled else "disabled"
+        for w in (self.search_entry, self.search_btn, self.curated_btn,
+                  self.manual_repo, self.manual_file, self.manual_btn):
+            w.configure(state=state)
 
 
 # ---------------------------------------------------------------------------

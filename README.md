@@ -29,11 +29,15 @@ seçildiğinde gereklidir.
   gemini-2.5-pro), yokken gömülü yerel motor (llama.cpp / GGUF). Arayüzden tek tıkla
   geçiş. Gemini bağlantısı güncel google-genai SDK'sı ile kurulur. Çevrimdışı motor
   için harici bir program (Ollama vb.) GEREKMEZ; tamamen uygulamaya gömülüdür.
-- Arayüzden model indirme: "İndirilenler" sekmesinden önerilen GGUF modelleri (Qwen2.5
-  1.5B/3B/7B, Llama 3.1 8B, Gemma 2 9B) tek tıkla, ilerleme çubuğuyla indirilir;
-  terminal veya harici komut gerekmez. Tüm model kataloğu burada listelenir (başka
-  bilgisayarlara kurulumda kolaylık için). İndirilen model "Modeller" sekmesinden
-  aktif seçilir; silme de "İndirilenler" sekmesinden yapılır.
+- Arayüzden model indirme ("İndirilenler" sekmesi), üç yolla:
+  - Önerilenler: 0.5B'den 72B'ye kadar doğrulanmış hızlı liste (Qwen2.5/Qwen3, Llama 3.1/3.2/3.3,
+    Gemma 2, Phi-3.5/Phi-4, Mistral/Ministral/Mixtral; MoE dahil); her modelin yanında boyutu ve
+    gerekli RAM/VRAM yazar. Büyük modeller (70B+) 128 GB RAM gibi güçlü makinelerde CPU ile çalışır.
+  - Arama: Hugging Face'te GGUF modellerini isimle arayıp (ör. qwen3, llama 3.3, phi-4)
+    repodaki bir quantization dosyasını seçerek indirme — tüm güncel modellere erişim.
+  - Manuel: repo kimliği + dosya adını doğrudan yazarak indirme.
+  Tek tıkla, ilerleme çubuğuyla iner; terminal/harici komut gerekmez. İndirilen model
+  "Modeller" sekmesinden aktif seçilir; silme "İndirilenler" sekmesinden yapılır.
 - Geçmiş sohbetler (Gemini benzeri): her sohbet diske kaydedilir; uygulama kapanıp
   açıldığında sol panelde listede kalır. Yeni sohbet açma, geçmişe tıklayıp devam
   etme ve silme desteklenir.

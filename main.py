@@ -238,6 +238,8 @@ class GemiAsistaniApp(*_APP_BASES):
             on_download=self._on_download_model,
             on_cancel_download=self._on_cancel_download,
             on_delete_model=self._on_delete_model,
+            on_search=self._on_search_models,
+            on_select_repo=self._on_select_repo,
         )
         self.settings_view = SettingsView(
             self.content,
@@ -429,6 +431,75 @@ class GemiAsistaniApp(*_APP_BASES):
         active = self.models_view.get_active_model()
         self.models_view.set_downloaded_models(downloaded, active=active)
         self.downloads_view.set_curated(self.model_manager.curated(), downloaded)
+
+    def _set_ready_status(self) -> None:
+        """Durum çubuğunu 'hazır' (parça sayısıyla) durumuna döndürür."""
+        try:
+            count = self.embedder.get_document_count()
+        except Exception:  # noqa: BLE001
+            count = 0
+        self.rail.set_status(f"Hazır ({count} parça)", "lightgreen")
+
+    def _on_search_models(self, query: str) -> None:
+        """
+        Hugging Face'te GGUF modellerini arar (arka planda, internet gerekir).
+        query boşsa en popüler GGUF modelleri listelenir (tüm kataloğu gezme).
+        """
+        if self._busy:
+            return
+        query = (query or "").strip()
+        if query:
+            self.downloads_view.begin_search(f"Arama: {query}")
+            self._set_busy(True, f"Aranıyor: {query}")
+        else:
+            self.downloads_view.begin_search("En popüler GGUF modelleri")
+            self._set_busy(True, "Popüler modeller getiriliyor...")
+
+        def task():
+            return self.model_manager.search_hf_models(query, limit=60)
+
+        def done(result, error):
+            self._set_busy(False)
+            self._set_ready_status()
+            if error:
+                self.downloads_view.set_search_results([])
+                messagebox.showerror(
+                    "Arama Hatası",
+                    f"Modeller aranamadı:\n{error}\n\n"
+                    "İnternet bağlantınızı kontrol edip tekrar deneyin.",
+                )
+                return
+            self.downloads_view.set_search_results(
+                result, downloaded=self.model_manager.list_downloaded()
+            )
+
+        self._run_in_background(task, on_done=done)
+
+    def _on_select_repo(self, repo_id: str) -> None:
+        """Seçilen reponun .gguf dosyalarını listeler (arka planda)."""
+        if self._busy:
+            return
+        self.downloads_view.begin_repo_files(repo_id)
+        self._set_busy(True, f"Dosyalar getiriliyor: {repo_id}")
+
+        def task():
+            return self.model_manager.list_repo_gguf_files(repo_id)
+
+        def done(result, error):
+            self._set_busy(False)
+            self._set_ready_status()
+            if error:
+                self.downloads_view.set_repo_files(repo_id, [])
+                messagebox.showerror(
+                    "Dosya Listesi Hatası",
+                    f"Repo dosyaları getirilemedi:\n{error}",
+                )
+                return
+            self.downloads_view.set_repo_files(
+                repo_id, result, downloaded=self.model_manager.list_downloaded()
+            )
+
+        self._run_in_background(task, on_done=done)
 
     def _on_download_model(self, model: dict) -> None:
         """Bir GGUF modelini arka planda indirir (ilerleme + iptal)."""
