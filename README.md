@@ -234,14 +234,14 @@ Paketleme sırasında dikkat edilmesi gereken noktalar:
 - Embedding ve OCR modelleri ayrıca dahil edilmelidir (bkz. Tamamen Çevrimdışı Dağıtım).
 - Gömülü motor (llama-cpp-python) spec'te `collect_all` ile toplanır. LLM GPU
   hızlandırması için `ggml-cuda.dll` (~700 MB) kullanılır; bunun muhtaç olduğu
-  cudart/cublas/cublasLt DLL'leri torch'un CUDA sürümü yerine küçük `nvidia-*-cu12`
-  paketlerinden gelir (boyut için torch CPU sürümü kullanılır). Uygulama import
-  öncesi bu DLL'leri DLL yoluna ekleyip önceden yükler.
+  cudart/cublas/cublasLt DLL'leri torch'un CUDA sürümüyle `torch/lib` içinde gelir.
+  Uygulama import öncesi bu DLL'leri DLL yoluna ekleyip önceden yükler.
 - GGUF modelleri pakete gömülmez; çalışma anında `data/models_gguf/`'a indirilir.
 - UPX sıkıştırması kapalıdır; torch/onnxruntime kütüphanelerini bozabilir.
 - Boyut optimizasyonu: spec, çalışma anında kullanılmayan `.lib`/`.pdb` dosyalarını
-  paketten eler ve CUDA DLL'lerinin çift kopyalanmasını önler. Sonuç uygulama klasörü
-  ~2.4 GB'dır (indirilen modeller `data/` altında ayrıdır).
+  (ör. `dnnl.lib` ~623 MB) paketten eler. CUDA torch ile uygulama klasörü ~5 GB,
+  CPU torch ile ~2.4 GB olur. CPU torch küçüktür ama taranmış PDF OCR'ı çok yavaşlar
+  (bkz. requirements.txt'teki torch notu); GPU varsa CUDA torch önerilir.
 
 ### Tek dosyalık kurulum (Inno Setup)
 

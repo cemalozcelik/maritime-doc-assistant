@@ -30,13 +30,13 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 # Gömülü motor (llama-cpp-python) CUDA wheel'i, CUDA runtime DLL'lerine (cudart,
-# cublas, cublasLt) ihtiyaç duyar. Paket boyutunu küçültmek için torch'un CPU
-# sürümü kullanılır; bu DLL'ler artık küçük 'nvidia-*-cu12' pip paketlerinden
-# gelir (nvidia/cublas/bin, nvidia/cuda_runtime/bin). llama_cpp import EDİLMEDEN
-# ÖNCE bu klasörler Windows'un DLL arama yoluna eklenir; aksi halde 'Could not
-# find module llama.dll (or one of its dependencies)' hatası alınır. Klasörlerden
-# hiçbiri yoksa (saf CPU llama wheel'i) bu adım zararsızca atlanır. torch'un CUDA
-# sürümü kuruluysa 'torch/lib' de yedek olarak eklenir.
+# cublas, cublasLt) ihtiyaç duyar. Bu DLL'ler torch'un CUDA sürümüyle 'torch/lib'
+# içinde gelir (önerilen kurulum); torch CPU kullanılıyorsa 'nvidia-*-cu12' pip
+# paketlerinden de (nvidia/cublas/bin, nvidia/cuda_runtime/bin) gelebilir. Yardımcı
+# her iki yeri de arar. llama_cpp import EDİLMEDEN ÖNCE bu klasörler Windows'un DLL
+# arama yoluna eklenir ve DLL'ler açıkça önceden yüklenir; aksi halde 'Could not
+# find module llama.dll (or one of its dependencies)' hatası alınır. Hiçbiri yoksa
+# (saf CPU llama wheel'i) bu adım zararsızca atlanır.
 _LLAMA_DLL_READY = False
 
 

@@ -29,14 +29,15 @@ sentence-transformers>=2.7.0
 # PyTorch: torch ve torchvision SÜRÜMLERİ BİRBİRİYLE EŞLEŞMELİDİR; aksi halde
 # "operator torchvision::nms does not exist" hatası alınır.
 #
-# ÖNEMLİ - paket boyutu: torch SADECE embedding ve OCR için kullanılır (LLM
-# ayrı motorla, llama-cpp-python ile çalışır). Bu yüzden torch'un CPU sürümü
-# önerilir. torch'un CUDA sürümü ~4.4 GB'dır ve .exe'yi gereksiz şişirir; CPU
-# sürümü ~1.1 GB'dır. Embedding (e5-base) CPU'da hızlı, OCR tek seferliktir.
-#   torch CPU kurulumu (önerilen):
+# torch; embedding (e5-base) ve OCR (EasyOCR) için kullanılır. Taranmış PDF'lerin
+# OCR'ı CPU'da ~5-10 kat YAVAŞTIR; bu yüzden NVIDIA GPU varsa CUDA sürümü önerilir
+# (OCR ve embedding GPU'da hızlanır). Bedeli: torch CUDA ~4.4 GB'dır ve .exe'yi
+# büyütür (~5 GB). Çok taranmış doküman işleyecekseniz bu denge mantıklıdır.
+#   torch CUDA kurulumu (önerilen, NVIDIA GPU için), örn. CUDA 12.1:
+#       pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1 torchvision==0.20.1
+#   GPU yoksa / küçük .exe isterseniz CPU çiftini kurun (OCR yavaş olur):
 #       pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 torchvision==0.20.1
-#   (Embedding/OCR'ı da GPU'da istiyorsanız cu121 çiftini kurun; ama .exe büyür.)
-torch==2.5.1                   # CPU sürümü için yukarıdaki --index-url komutunu kullanın
+torch==2.5.1                   # CUDA için yukarıdaki cu121 --index-url komutunu kullanın
 torchvision==0.20.1           # torch ile eşleşmeli
 
 # --- Lokal Vektör Veritabanı (kalıcı/persistent) ---
@@ -57,15 +58,12 @@ huggingface_hub>=0.20.0        # Model deposu yardımcıları (indirme/önbellek
 #   kullanın. Örn. CUDA 12.1:
 #       pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 llama-cpp-python>=0.3.0
-
-# CUDA runtime DLL'leri (LLM GPU hızlandırması için). torch'un CPU sürümü
-# kullanıldığından (yukarıya bakın) cudart/cublas/cublasLt DLL'leri artık bu
-# küçük paketlerden gelir (~0.6 GB). llama-cpp-python'ın CUDA wheel'i bunlara
-# muhtaçtır; uygulama import öncesi bunları DLL yoluna ekleyip önceden yükler.
-# SADECE GPU (NVIDIA) ile çalışacaksanız gereklidir; saf CPU kurulumda atlanabilir.
-#   pip install nvidia-cublas-cu12==12.1.3.1 nvidia-cuda-runtime-cu12==12.1.105
-nvidia-cublas-cu12==12.1.3.1
-nvidia-cuda-runtime-cu12==12.1.105
+#
+# Not: llama-cpp-python'ın CUDA wheel'i çalışma anında cudart/cublas/cublasLt
+# DLL'lerine ihtiyaç duyar. CUDA torch kurulduğunda (önerilen) bu DLL'ler
+# 'torch/lib' içinde gelir; uygulama import öncesi onları DLL yoluna ekler.
+# (Yalnızca torch'un CPU sürümünü kullanıyorsanız bu DLL'leri ayrıca sağlamak
+#  için: pip install nvidia-cublas-cu12==12.1.3.1 nvidia-cuda-runtime-cu12==12.1.105)
 
 # --- Performans ölçümü (uygulama içi metrik bloğu ve benchmark.py) ---
 psutil>=5.9.0                  # CPU / RAM ölçümü

@@ -60,35 +60,10 @@ if _os.path.isfile("icon.png"):
 if _os.path.isfile("icon.ico"):
     datas += [("icon.ico", ".")]
 
-# ----------------------------------------------------------------------------
-#  CUDA runtime DLL'leri (LLM GPU hızlandırması için).
-#  torch'un CPU sürümü kullanıldığından bu DLL'ler artık 'nvidia-*-cu12' pip
-#  paketlerinden gelir. ggml-cuda.dll bunlara muhtaçtır; onedir modunda aynı
-#  klasöre konduklarında Windows otomatik bulur. Paket boyutunu küçük tutmak
-#  için (torch CUDA ~4.4 GB yerine ~0.6 GB) bu yöntem tercih edilir.
-# ----------------------------------------------------------------------------
-import sys as _sys
-import glob as _glob
-_cuda_dlls = ("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
-_seen = set()
-for _p in _sys.path:
-    if not _p or not _os.path.isdir(_p):
-        continue
-    for _name in _cuda_dlls:
-        for _hit in _glob.glob(_os.path.join(_p, "nvidia", "*", "bin", _name)):
-            if _name in _seen:
-                continue
-            # Hedef yolu kaynaktaki 'nvidia/<paket>/bin' yapısıyla AYNI tut; böylece
-            # PyInstaller'ın otomatik topladığı kopyayla çakışıp ÇİFTLENMEZ ve
-            # çalışma zamanı yardımcısı (_ensure_llama_loadable) onu burada bulur.
-            _rel = _hit[_hit.lower().index("nvidia"):]
-            binaries.append((_hit, _os.path.dirname(_rel)))
-            _seen.add(_name)
-            print(f"[spec] CUDA DLL eklendi: {_hit} -> {_os.path.dirname(_rel)}")
-_missing = [d for d in _cuda_dlls if d not in _seen]
-if _missing:
-    print(f"[spec] UYARI: CUDA DLL bulunamadi: {_missing} -> LLM GPU calismayabilir. "
-          f"Kurulum: pip install nvidia-cublas-cu12==12.1.3.1 nvidia-cuda-runtime-cu12==12.1.105")
+# Not: LLM GPU hızlandırması için gerekli CUDA runtime DLL'leri (cudart, cublas,
+# cublasLt) torch'un CUDA sürümüyle birlikte 'torch/lib' içinde gelir ve
+# collect_all("torch") ile pakete eklenir. Uygulama, llama_cpp import edilmeden
+# önce bu klasörü DLL yoluna ekleyip DLL'leri önceden yükler (llm_connector).
 
 # ----------------------------------------------------------------------------
 #  Boyut optimizasyonu: çalışma zamanında GEREKSİZ dosyaları paketten çıkar.
