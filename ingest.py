@@ -54,11 +54,17 @@ from document_processor import (  # noqa: E402
 )
 from embedding_manager import EmbeddingManager  # noqa: E402
 
-EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
+EMBEDDING_MODEL = "BAAI/bge-m3"
 
 
 def _project_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_model(name: str) -> str:
+    """Önce projedeki yerel 'models/<isim>' klasörü (safetensors, çevrimdışı), yoksa HF adı."""
+    local = os.path.join(_project_dir(), "models", name.replace("/", "_"))
+    return local if os.path.isdir(local) else name
 
 
 def _new_agg() -> dict:
@@ -129,7 +135,7 @@ def main() -> None:
         drawings_dir=os.path.join(data_dir, "drawings"),
     )
     embedder = EmbeddingManager(
-        model_name_or_path=EMBEDDING_MODEL,
+        model_name_or_path=_resolve_model(EMBEDDING_MODEL),
         persist_directory=os.path.join(data_dir, "vector_store"),
         collection_name="gemi_dokumanlari",
     )

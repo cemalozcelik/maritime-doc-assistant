@@ -49,7 +49,12 @@ import perf_monitor as pm
 from perf_monitor import ResourceSampler
 
 
-EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
+EMBEDDING_MODEL = "BAAI/bge-m3"
+# Önce projedeki yerel 'models/' klasörü (safetensors, çevrimdışı), yoksa HF adı.
+_local_model = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "models", EMBEDDING_MODEL.replace("/", "_"))
+if os.path.isdir(_local_model):
+    EMBEDDING_MODEL = _local_model
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vector_store")
 TOP_K = 8
 

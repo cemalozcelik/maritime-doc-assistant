@@ -172,14 +172,26 @@ class LocalEmbedder:
                     "Embedding modeli yükleniyor/indiriliyor: %s "
                     "(internet yoksa lokal cache kullanılır)", target
                 )
+            # use_safetensors=True: torch < 2.6 ile .bin ağırlıklarını yüklemek
+            # güvenlik kısıtı nedeniyle reddediliyor (CVE-2025-32434). bge-m3 vb.
+            # modeller safetensors sağlar; bunu zorlayarak yüklemeyi garanti ederiz.
             try:
-                self._model = SentenceTransformer(target, device=self._device)
+                self._model = SentenceTransformer(
+                    target, device=self._device,
+                    model_kwargs={"use_safetensors": True},
+                )
                 return self._model
             except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(
-                    f"Embedding modeli yüklenemedi ('{target}'). İnternet yoksa "
-                    f"modelin lokalde mevcut olduğundan emin olun. Hata: {exc}"
-                ) from exc
+                logger.warning("safetensors ile yükleme başarısız (%s); standart "
+                               "yükleme deneniyor.", exc)
+                try:
+                    self._model = SentenceTransformer(target, device=self._device)
+                    return self._model
+                except Exception as exc2:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"Embedding modeli yüklenemedi ('{target}'). İnternet yoksa "
+                        f"modelin lokalde mevcut olduğundan emin olun. Hata: {exc2}"
+                    ) from exc2
 
     def _encode(self, texts: List[str]) -> List[List[float]]:
         model = self._ensure_model()
@@ -396,7 +408,10 @@ class EmbeddingManager:
     # Bir aday KORUNUR eğer: lexical (BM25) eşleşmesi varsa VEYA dense mesafesi
     # bu eşiğin altındaysa. Hiçbiri yoksa (alakasız soru) boş döner -> LLM
     # 'dokümanda bulunmuyor' demeli.
-    DEFAULT_MAX_DISTANCE = 0.22
+    # bge-m3 ölçeği: ilgili parçalar tipik olarak ~0.30-0.48, alakasız ~0.50+.
+    # 0.50 recall-güvenli (gerçek sorular kırılmaz); pizza/film gibi tamamen
+    # alakasızlar elenir. Hibrit lexical sinyal sıralamayı ayrıca güçlendirir.
+    DEFAULT_MAX_DISTANCE = 0.48
     RRF_K0 = 60  # Reciprocal Rank Fusion sabiti.
     # Lexical eşleşmede yalnızca AYIRT EDİCİ terimler sayılır. idf bu eşiğin
     # altındaki yaygın kelimeler (stopword: "ve", "nasıl", "sistem", "gemi"...)
@@ -493,8 +508,11 @@ class EmbeddingManager:
             raise RuntimeError(f"Benzerlik araması başarısız: {exc}") from exc
 
         # --- RRF füzyonu + reddetme kapısı ---
+        # Adaylar yalnızca DENSE havuzundan (bge-m3 dense recall güçlü). BM25
+        # yalnızca dense-havuzu içinde YENİDEN SIRALAMA için kullanılır; tek bir
+        # yaygın terimle eşleşip alakasız soruya doküman döndürmesini önler.
         big = 10 * fetch_k
-        candidates = set(dense_rank) | set(bm_rank)
+        candidates = set(dense_rank)
         fused = {
             cid: 1.0 / (self.RRF_K0 + dense_rank.get(cid, big))
                  + 1.0 / (self.RRF_K0 + bm_rank.get(cid, big))

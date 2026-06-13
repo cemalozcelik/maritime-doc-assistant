@@ -37,7 +37,7 @@ logger = logging.getLogger("main")
 # Kullanılan embedding modeli. Çevrimdışı kontrolü, ağır kütüphaneler
 # (transformers/huggingface_hub) import EDİLMEDEN ÖNCE yapılmalı; bu yüzden bu
 # sabit ve yardımcılar dosyanın en başında tanımlanır.
-EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
+EMBEDDING_MODEL = "BAAI/bge-m3"
 
 
 def resource_path(relative: str) -> str:
@@ -173,7 +173,7 @@ else:
 class GemiAsistaniApp(*_APP_BASES):
     """Uygulamanın ana penceresi ve koordinatörü."""
 
-    EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
+    EMBEDDING_MODEL = "BAAI/bge-m3"
     TOP_K = 8  # Her soruda kaç bağlam parçası getirilsin (eşik elemesinden sonra).
 
     def __init__(self) -> None:
