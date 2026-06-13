@@ -24,12 +24,16 @@ langchain>=0.2.0
 langchain-text-splitters>=0.2.0
 
 # --- Lokal Embedding modeli ---
+# Model: BAAI/bge-m3 (çok dilli, güçlü çapraz-dil retrieval). ~2,2 GB; safetensors
+# olarak models/BAAI_bge-m3'e export edilip oradan yüklenir (torch<2.6 .bin
+# yükleyemez). Hibrit retrieval (dense + BM25) için ek bağımlılık YOKTUR (BM25
+# embedding_manager içinde, harici kütüphanesiz).
 sentence-transformers>=2.7.0
 #
 # PyTorch: torch ve torchvision SÜRÜMLERİ BİRBİRİYLE EŞLEŞMELİDİR; aksi halde
 # "operator torchvision::nms does not exist" hatası alınır.
 #
-# torch; embedding (e5-base) ve OCR (EasyOCR) için kullanılır. Taranmış PDF'lerin
+# torch; embedding (bge-m3) ve OCR (EasyOCR) için kullanılır. Taranmış PDF'lerin
 # OCR'ı CPU'da ~5-10 kat YAVAŞTIR; bu yüzden NVIDIA GPU varsa CUDA sürümü önerilir
 # (OCR ve embedding GPU'da hızlanır). Bedeli: torch CUDA ~4.4 GB'dır ve .exe'yi
 # büyütür (~5 GB). Çok taranmış doküman işleyecekseniz bu denge mantıklıdır.

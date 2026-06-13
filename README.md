@@ -60,8 +60,9 @@ seçildiğinde gereklidir.
   (EasyOCR, Türkçe + İngilizce); GPU varsa otomatik kullanılır.
 - Kalıcı vektör veritabanı: ChromaDB ile veriler diske yazılır; uygulama kapatılsa
   bile dokümanlar korunur.
-- Türkçe ve İngilizce embedding: intfloat/multilingual-e5-base modeli; GPU varsa
-  otomatik olarak CUDA üzerinde çalışır.
+- Çok dilli embedding: BAAI/bge-m3 modeli (Türkçe/İngilizce/Korece ve çapraz-dil
+  arama güçlü); GPU varsa otomatik CUDA üzerinde çalışır. Hibrit retrieval (dense
+  + BM25 anahtar kelime, RRF füzyonu) ile teknik terimlerde isabet artar.
 - Gerçek çevrimdışı çalışma: model lokalde mevcutsa Hugging Face açılışta otomatik
   çevrimdışı moda alınır, internet yokken ağ çağrısı denenmez.
 - Yanıtı tek tıkla panoya kopyalama düğmesi.
@@ -129,8 +130,10 @@ destekli wheel ile kurun (torch ile aynı CUDA sürümü; örn. CUDA 12.1):
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 ```
 
-İlk çalıştırmada embedding modeli (yaklaşık 1,1 GB) ve ilk OCR işleminde EasyOCR
-modelleri bir kez indirilir. Yerel dil modeli (GGUF) ise "İndirilenler" sekmesinden
+İlk çalıştırmada embedding modeli (BAAI/bge-m3, yaklaşık 2,2 GB) ve ilk OCR
+işleminde EasyOCR modelleri bir kez indirilir. (Çevrimdışı/torch<2.6 uyumu için
+model `models/BAAI_bge-m3` altına safetensors olarak export edilip oradan
+yüklenir; bkz. "Embedding modelini projeye dahil etme".) Yerel dil modeli (GGUF) ise "İndirilenler" sekmesinden
 bir kez indirilir. Bu indirmelerden sonra uygulama tamamen internetsiz çalışır.
 
 ---
@@ -190,13 +193,16 @@ Embedding modelini projeye dahil etme:
 
 ```python
 from sentence_transformers import SentenceTransformer
-SentenceTransformer("intfloat/multilingual-e5-base").save(
-    "models/intfloat_multilingual-e5-base"
+# safe_serialization=True -> safetensors (torch<2.6 ile .bin yüklenemez).
+SentenceTransformer("BAAI/bge-m3", model_kwargs={"use_safetensors": True}).save(
+    "models/BAAI_bge-m3", safe_serialization=True
 )
 ```
 
-`main.py` açılışta önce `models/<model-adı>` klasörünü kontrol eder; mevcutsa modeli
-internetsiz olarak buradan yükler.
+`main.py`/`ingest.py` açılışta önce `models/<model-adı>` klasörünü kontrol eder;
+mevcutsa modeli internetsiz olarak buradan yükler. bge-m3 ~2,2 GB'dir; `.exe`'ye
+gömmek isterseniz `gemi_asistani.spec` içindeki `datas += [("models", "models")]`
+satırını açın (paket boyutu o kadar artar).
 
 EasyOCR modelleri ilk OCR işleminde `C:\Users\<kullanıcı>\.EasyOCR\model` dizinine
 iner. Bu dizin hedef bilgisayarda aynı konuma kopyalanmalı veya kod içinde
@@ -269,7 +275,7 @@ verebilir; kalıcı çözüm kod imzalama sertifikasıdır.
 | PDF okuma/render  | PyMuPDF (fitz)                                        |
 | OCR               | EasyOCR (Türkçe + İngilizce)                          |
 | Metin parçalama   | LangChain RecursiveCharacterTextSplitter             |
-| Embedding         | sentence-transformers, intfloat/multilingual-e5-base |
+| Embedding         | sentence-transformers, BAAI/bge-m3 (hibrit: dense + BM25) |
 | Vektör veritabanı | ChromaDB (persistent)                                |
 | Dil modeli        | Google Gemini API (google-genai), gömülü llama.cpp (llama-cpp-python, GGUF) |
 | Model indirme     | huggingface_hub, requests (HF resolve, akışlı)       |
