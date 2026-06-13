@@ -47,6 +47,24 @@ def _tokenize(text: str) -> List[str]:
     return _TOKEN_RE.findall(text.lower())
 
 
+_NUM_RE = re.compile(r"\d+")
+_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm_for_dedup(text: str) -> str:
+    """
+    Boilerplate tespiti için normalize: küçük harf, rakamlar (sayfa no vb.)
+    silinir, noktalama boşluğa çevrilir, boşluklar teke iner. Böylece
+    "All type Page 2/3 Normal Operation..." gibi yalnızca sayfa numarasıyla
+    farklılaşan tekrarlayan başlıklar AYNI forma indirgenir. Tüm script'lerin
+    harfleri (Latin/Türkçe/Korece) korunur (\\w, re.UNICODE).
+    """
+    t = _NUM_RE.sub("", text.lower())
+    t = _PUNCT_RE.sub(" ", t)
+    return _WS_RE.sub(" ", t).strip()
+
+
 class _BM25:
     """
     Minimal, harici bağımlılıksız BM25 (Okapi) — lexical (anahtar kelime) arama.
@@ -225,6 +243,12 @@ class EmbeddingManager:
         self._lex_metas: List[dict] = []
         self._lex_dirty = True
 
+        # Boilerplate dedup: bu oturumda eklenen chunk'ların normalize edilmiş
+        # formları. Aynı form ikinci kez gelirse (tekrarlayan başlık/footer)
+        # atlanır; benzersiz içerik daima korunur. Bulk ingest'te global çalışır.
+        self._seen_norm: set = set()
+        self.last_deduped = 0
+
     # ------------------------------------------------------------------ #
     #  Veritabanı Bağlantısı (Lazy + Thread-safe)
     # ------------------------------------------------------------------ #
@@ -289,6 +313,25 @@ class EmbeddingManager:
                        (text, source, page, chunk_index alanları beklenir).
         :return: Eklenen parça sayısı.
         """
+        if not chunks:
+            return 0
+
+        # Boilerplate dedup: normalize formu daha önce görülen (tekrarlayan
+        # başlık/footer) chunk'ları atla. Benzersiz içerik daima korunur.
+        deduped_chunks = []
+        skipped = 0
+        for chunk in chunks:
+            norm = _norm_for_dedup(getattr(chunk, "text", "") or "")
+            if norm and norm in self._seen_norm:
+                skipped += 1
+                continue
+            if norm:
+                self._seen_norm.add(norm)
+            deduped_chunks.append(chunk)
+        self.last_deduped = skipped
+        if skipped:
+            logger.info("Dedup: %d tekrarlayan boilerplate chunk atlandı.", skipped)
+        chunks = deduped_chunks
         if not chunks:
             return 0
 
@@ -520,6 +563,7 @@ class EmbeddingManager:
                 )
                 self._bm25 = None
                 self._lex_dirty = True
+                self._seen_norm = set()  # dedup durumunu da sıfırla
                 logger.info("Vektör veritabanı temizlendi.")
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(f"Veritabanı temizlenemedi: {exc}") from exc
