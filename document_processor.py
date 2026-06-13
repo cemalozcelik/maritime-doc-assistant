@@ -39,14 +39,9 @@ try:
 except ImportError:  # pragma: no cover
     fitz = None
 
-# LangChain metin parçalayıcı
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except ImportError:  # Eski LangChain sürümleri için geri uyumluluk
-    try:
-        from langchain.text_splitter import RecursiveCharacterTextSplitter
-    except ImportError:
-        RecursiveCharacterTextSplitter = None
+# LangChain metin parçalayıcı LAZY yüklenir (bkz. _get_splitter). Bu paketin
+# import'u ~8 sn sürdüğünden, modül/uygulama açılışını bloklamaması için yalnızca
+# ilk doküman işlemede (arka planda) yüklenir. Aksi halde arayüz geç açılır.
 
 # Pillow -> görsel açma / OCR ön-işleme
 try:
@@ -494,21 +489,35 @@ class DocumentProcessor:
         self._cache = OcrCache(cache_dir) if cache_dir else None
         self.ocr_engine = "easyocr"
 
-        # OCR motoru ilk kullanımda yüklenecek (lazy).
+        # OCR motoru ve metin parçalayıcı ilk kullanımda yüklenecek (lazy).
         self._ocr_reader = None
+        self._splitter = None  # bkz. _get_splitter (langchain lazy)
 
-        if RecursiveCharacterTextSplitter is None:
-            raise ImportError(
-                "langchain-text-splitters bulunamadı. "
-                "Lütfen 'pip install langchain-text-splitters' çalıştırın."
-            )
+    def _get_splitter(self):
+        """RecursiveCharacterTextSplitter'ı ilk ihtiyaçta (lazy) oluşturur.
 
+        langchain import'u ~8 sn sürdüğü için açılışta DEĞİL, ilk doküman
+        işlemede (arka plan thread'i) yüklenir; böylece arayüz hızlı açılır.
+        """
+        if self._splitter is not None:
+            return self._splitter
+        try:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+        except ImportError:  # Eski LangChain sürümleri için geri uyumluluk
+            try:
+                from langchain.text_splitter import RecursiveCharacterTextSplitter
+            except ImportError as exc:
+                raise ImportError(
+                    "langchain-text-splitters bulunamadı. "
+                    "Lütfen 'pip install langchain-text-splitters' çalıştırın."
+                ) from exc
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
             separators=["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""],
             length_function=len,
         )
+        return self._splitter
 
     # ------------------------------------------------------------------ #
     #  OCR Motoru (Lazy Loading)
@@ -1013,7 +1022,7 @@ class DocumentProcessor:
         """
         if not text or not text.strip():
             return []
-        raw = [c.strip() for c in self._splitter.split_text(text)]
+        raw = [c.strip() for c in self._get_splitter().split_text(text)]
         raw = [c for c in raw if c]
         kept = [c for c in raw if not self._is_garbage(c)]
         if not kept and raw:
