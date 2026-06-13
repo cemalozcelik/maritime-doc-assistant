@@ -834,9 +834,23 @@ class GemiAsistaniApp(*_APP_BASES):
         def task():
             from perf_monitor import ResourceSampler, format_perf_block
 
+            # Çapraz-dil için sorguyu İngilizce'ye çevir (korpus ağırlıklı İngilizce);
+            # TR + EN varyantlarını multi-query RRF ile birlikte ara. Çeviri
+            # başarısızsa sözlük-tabanlı genişletmeye düşülür (offline güvenli).
+            queries = [question]
+            try:
+                en = self.llm.translate_to_english(question)
+                if en and en.strip().lower() != question.strip().lower():
+                    queries.append(en)
+            except Exception:  # noqa: BLE001
+                pass
+            if len(queries) == 1:  # çeviri yok -> sözlükle genişlet
+                from embedding_manager import expand_query_tr_en
+                queries = expand_query_tr_en(question)
+
             with ResourceSampler() as sampler:
                 t0 = time.perf_counter()
-                contexts = self.embedder.similarity_search(question, k=self.TOP_K)
+                contexts = self.embedder.multi_query_search(queries, k=self.TOP_K)
                 t1 = time.perf_counter()
                 response = self.llm.ask(question, contexts)
                 t2 = time.perf_counter()
@@ -864,12 +878,25 @@ class GemiAsistaniApp(*_APP_BASES):
                 return
 
             answer = response.text
+            # Kaynak/cevap çelişkisini önle: model "dokümanda bulunmuyor" dediyse
+            # "Kaynaklar" listesi yanıltıcı olur. Bu durumda kaynakları, yalnızca
+            # DEĞERLENDİRİLEN (doğrudan kaynaklık etmemiş olabilecek) parçalar olarak
+            # ve net bir notla göster.
             if contexts:
                 sources = sorted({
                     f"{c.source}" + (f" (s.{c.page})" if c.page else "")
                     for c in contexts
                 })
-                answer += "\n\nKaynaklar: " + ", ".join(sources)
+                ans_low = (response.text or "").lower()
+                not_found = any(m in ans_low for m in (
+                    "dokümanlarda bulunmuyor", "dokümanda bulunmuyor",
+                    "dokümanlarda yok", "belgelerde bulunmuyor",
+                ))
+                if not_found:
+                    answer += ("\n\nDeğerlendirilen kaynaklar (cevaba doğrudan "
+                               "kaynaklık etmedi): " + ", ".join(sources))
+                else:
+                    answer += "\n\nKaynaklar: " + ", ".join(sources)
             answer += "\n\n" + perf_text
             self.chat.update_message(thinking_label, answer)
 

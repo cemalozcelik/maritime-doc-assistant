@@ -560,3 +560,30 @@ class LLMConnector:
             )
         prompt = self.build_prompt(question, contexts)
         return self._connector.generate(prompt)
+
+    def translate_to_english(self, text: str) -> str:
+        """
+        Türkçe sorguyu, çapraz-dil retrieval için İngilizce'ye çevirir (kısa üretim).
+        Korpus ağırlıklı İngilizce olduğundan İngilizce varyant retrieval'i belirgin
+        iyileştirir. Başarısızlıkta boş string döner (çağıran orijinali kullanır).
+        """
+        if self._connector is None or not (text or "").strip():
+            return ""
+        prompt = (
+            "Translate the following Turkish marine-engineering question into English "
+            "for a technical document search. Keep technical terms accurate. Output "
+            "ONLY the English translation on a single line, with no quotes or "
+            "explanation.\n\nTurkish: " + text.strip() + "\nEnglish:"
+        )
+        try:
+            resp = self._connector.generate(prompt)
+            if not getattr(resp, "success", False):
+                return ""
+            lines = [ln.strip() for ln in (resp.text or "").splitlines() if ln.strip()]
+            out = lines[0] if lines else ""
+            # Olası "English:" tekrarını ve tırnakları temizle.
+            out = re.sub(r'^(english|ingilizce)\s*[:\-]\s*', '', out, flags=re.IGNORECASE)
+            return out.strip().strip('"').strip()[:300]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Çeviri başarısız: %s", exc)
+            return ""

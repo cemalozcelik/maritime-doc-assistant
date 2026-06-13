@@ -52,6 +52,60 @@ _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
 
 
+# ---------------------------------------------------------------------------
+#  TR -> EN sorgu genişletme (denizcilik/makine sözlüğü)
+# ---------------------------------------------------------------------------
+# Korpus ağırlıklı İngilizce (+ Korece). Türkçe sorgular çapraz-dilde dezavantajlı:
+# bge-m3 ilgili içeriği bulur ama mesafe ~0.04-0.06 daha yüksek çıkar ve eşik
+# sınırında elenebilir. Sorgudaki Türkçe teknik terimleri İngilizce karşılıklarıyla
+# değiştirip İKİNCİ bir varyant üretiriz; multi-query + RRF ile ikisini birleştiririz.
+# Çok kelimeli terimler önce (uzun eşleşme), sonra tekil kelimeler uygulanır.
+_TR_EN_TERMS = {
+    "ana makine": "main engine", "yardımcı makine": "auxiliary engine",
+    "egzoz sıcaklığı": "exhaust gas temperature", "egzoz gaz": "exhaust gas",
+    "basınç düşümü": "pressure drop", "basınç düşmesi": "pressure drop",
+    "yakıt enjeksiyon": "fuel injection", "yakıt pompası": "fuel pump",
+    "deniz suyu": "sea water", "tatlı su": "fresh water", "besleme suyu": "feed water",
+    "soğutma suyu": "cooling water", "yağlama yağı": "lubricating oil",
+    "devreye alma": "start up", "iki zamanlı": "two stroke", "2 zamanlı": "two stroke",
+    "dört zamanlı": "four stroke", "yardımcı kazan": "auxiliary boiler",
+    "egzoz": "exhaust", "sıcaklık": "temperature", "basınç": "pressure",
+    "farklılık": "deviation", "fark": "deviation", "sapma": "deviation",
+    "kompresör": "compressor", "kazan": "boiler", "yakıt": "fuel",
+    "separatör": "separator", "seperatör": "separator", "purifier": "purifier",
+    "silindir": "cylinder", "piston": "piston", "supap": "valve", "valf": "valve",
+    "soğutma": "cooling", "soğutucu": "cooler", "pompa": "pump", "türbin": "turbine",
+    "turboşarj": "turbocharger", "türboşarj": "turbocharger", "jeneratör": "generator",
+    "incineratör": "incinerator", "inceneratör": "incinerator", "yakma": "incineration",
+    "bakım": "maintenance", "arıza": "fault", "çalıştırma": "operation",
+    "yağ": "oil", "yağlama": "lubrication", "filtre": "filter", "conta": "gasket",
+    "rulman": "bearing", "yatak": "bearing", "mil": "shaft", "dişli": "gear",
+    "brülör": "burner", "enjektör": "injector", "püskürtme": "injection",
+    "devir": "speed", "yük": "load", "alarm": "alarm", "kalibrasyon": "calibration",
+    "verim": "efficiency", "düşüklük": "low", "tıkanma": "blockage", "sızıntı": "leakage",
+    "titreşim": "vibration", "gürültü": "noise", "buhar": "steam", "kondens": "condensate",
+}
+
+
+def expand_query_tr_en(query: str) -> List[str]:
+    """
+    Sorgunun TR teknik terimlerini EN karşılıklarıyla değiştirip ek bir varyant
+    döndürür. Sonuç: [orijinal] veya [orijinal, ingilizce_varyant].
+    """
+    if not query or not query.strip():
+        return [query] if query else []
+    low = " " + query.lower() + " "
+    en = low
+    for tr, eng in sorted(_TR_EN_TERMS.items(), key=lambda kv: -len(kv[0])):
+        if tr in en:
+            en = en.replace(tr, eng)
+    en = _WS_RE.sub(" ", en).strip()
+    variants = [query]
+    if en and en != low.strip():
+        variants.append(en)
+    return variants
+
+
 def _norm_for_dedup(text: str) -> str:
     """
     Boilerplate tespiti için normalize: küçük harf, rakamlar (sayfa no vb.)
@@ -537,6 +591,45 @@ class EmbeddingManager:
             if len(contexts) >= k:
                 break
         return contexts
+
+    def multi_query_search(self, queries: List[str], k: int = 4,
+                           max_distance: Optional[float] = None) -> List[RetrievedContext]:
+        """
+        Birden çok sorgu varyantı için hibrit arama yapıp sonuçları Reciprocal Rank
+        Fusion (RRF) ile birleştirir. Çapraz-dil için TR + EN varyantları beraber
+        kullanmaya yarar: bir varyantın kaçırdığını diğeri yakalar.
+        """
+        queries = [q for q in (queries or []) if q and q.strip()]
+        if not queries:
+            return []
+        if len(queries) == 1:
+            return self.similarity_search(queries[0], k=k, max_distance=max_distance)
+
+        per = max(k * 3, 12)
+        fused: Dict[str, list] = {}  # key -> [rrf_skor, en_iyi_ctx]
+        for q in queries:
+            res = self.similarity_search(q, k=per, max_distance=max_distance)
+            for rank, c in enumerate(res):
+                key = "%s|%s|%s" % (c.source, c.page, (c.text or "")[:80])
+                rrf = 1.0 / (self.RRF_K0 + rank)
+                entry = fused.get(key)
+                if entry is None:
+                    fused[key] = [rrf, c]
+                else:
+                    entry[0] += rrf
+                    if c.score < entry[1].score:  # daha yakın mesafeli kopyayı tut
+                        entry[1] = c
+        ordered = sorted(fused.values(), key=lambda e: e[0], reverse=True)
+        return [e[1] for e in ordered[:k]]
+
+    def search_expanded(self, query: str, k: int = 4,
+                        max_distance: Optional[float] = None) -> List[RetrievedContext]:
+        """
+        TR->EN sorgu genişletme + multi-query RRF. Uygulamanın asıl çağırması
+        gereken metot: Türkçe sorguyu İngilizce varyantıyla birlikte arar.
+        """
+        return self.multi_query_search(
+            expand_query_tr_en(query), k=k, max_distance=max_distance)
 
     # ------------------------------------------------------------------ #
     #  Yardımcı / Yönetim
