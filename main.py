@@ -195,10 +195,15 @@ class GemiAsistaniApp(*_APP_BASES):
             cache_dir=os.path.join(data_dir, "ocr_cache"),
             drawings_dir=os.path.join(data_dir, "drawings"),
         )
+        # Embedding CPU'da: bge-m3 GPU'da ~2.2 GB yer kaplar; LLM (7B ~4.5 GB) ile
+        # birlikte 8 GB VRAM'i taşırıp LLM'i CPU'ya yayar (hız düşer). Sorgu-zamanı
+        # embedding ucuz (~1 sn), bu yüzden CPU'ya alıp VRAM'in tamamını LLM'e
+        # bırakıyoruz. (Toplu ingest ayrı süreçte GPU kullanır; bkz. ingest.py.)
         self.embedder = EmbeddingManager(
             model_name_or_path=local_embedding_model_path(self.EMBEDDING_MODEL),
             persist_directory=os.path.join(data_dir, "vector_store"),
             collection_name="gemi_dokumanlari",
+            device="cpu",
         )
         self.llm = LLMConnector()
         self.model_manager = ModelManager(

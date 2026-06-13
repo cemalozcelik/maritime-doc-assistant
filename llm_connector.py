@@ -363,12 +363,16 @@ class LocalLLMConnector(BaseLLMConnector):
             )
         logger.info("Yerel model yükleniyor: %s (n_gpu_layers=%s)",
                     self.model_path, self.n_gpu_layers)
-        self._llm = Llama(
-            model_path=self.model_path,
-            n_gpu_layers=self.n_gpu_layers,
-            n_ctx=self.n_ctx,
-            verbose=False,
-        )
+        # flash_attn=True: dikkat (attention) çekirdeğini hızlandırır VE KV cache
+        # belleğini küçültür -> 8 GB gibi sınırlı VRAM'de daha az taşma, daha hızlı.
+        # Eski/uyumsuz wheel'lerde param desteklenmezse parametresiz yüklemeye düşer.
+        common = dict(model_path=self.model_path, n_gpu_layers=self.n_gpu_layers,
+                      n_ctx=self.n_ctx, verbose=False)
+        try:
+            self._llm = Llama(flash_attn=True, n_batch=512, **common)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("flash_attn ile yükleme başarısız (%s); standart yükleme.", exc)
+            self._llm = Llama(**common)
         return self._llm
 
     def generate(self, prompt: str) -> LLMResponse:

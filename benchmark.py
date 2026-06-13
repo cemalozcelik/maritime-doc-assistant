@@ -190,9 +190,10 @@ def main() -> None:
     print(f"  Sağlayıcı / model      : {args.provider} / {args.model}")
     print("=" * 70)
 
-    # Modülleri hazırla.
+    # Modülleri hazırla. Embedding CPU'da: LLM ile aynı GPU'da VRAM çakışmasını
+    # önler (uygulamadaki davranışla tutarlı; bkz. main.py).
     embedder = EmbeddingManager(
-        model_name_or_path=EMBEDDING_MODEL, persist_directory=DATA_DIR
+        model_name_or_path=EMBEDDING_MODEL, persist_directory=DATA_DIR, device="cpu"
     )
     print("Embedding modeli ısındırılıyor...")
     t = time.perf_counter()
