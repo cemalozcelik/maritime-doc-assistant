@@ -25,14 +25,65 @@ Tasarım notu (ÖNEMLİ):
 from __future__ import annotations
 
 import os
+import re
 import time
+import math
 import uuid
 import logging
 import threading
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Tokenleştirme: Unicode kelime karakterleri (Latin/Türkçe/Korece/CJK dahil).
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _tokenize(text: str) -> List[str]:
+    """BM25 için basit, script-bağımsız tokenleştirme (küçük harf)."""
+    if not text:
+        return []
+    return _TOKEN_RE.findall(text.lower())
+
+
+class _BM25:
+    """
+    Minimal, harici bağımlılıksız BM25 (Okapi) — lexical (anahtar kelime) arama.
+    Dense (anlamsal) retrieval'ın gürültülü/OCR'lı teknik metinde kaçırdığı tam
+    terim eşleşmelerini yakalar. Ters indeks (postings) ile hızlı skorlar.
+    """
+
+    def __init__(self, corpus_tokens: List[List[str]], k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.N = len(corpus_tokens)
+        self.doc_len = [len(d) for d in corpus_tokens]
+        self.avgdl = (sum(self.doc_len) / self.N) if self.N else 0.0
+        self.postings: Dict[str, List[Tuple[int, int]]] = {}
+        df: Dict[str, int] = {}
+        for i, toks in enumerate(corpus_tokens):
+            tf: Dict[str, int] = {}
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
+            for t, freq in tf.items():
+                self.postings.setdefault(t, []).append((i, freq))
+                df[t] = df.get(t, 0) + 1
+        self.idf = {
+            t: math.log(1 + (self.N - n + 0.5) / (n + 0.5)) for t, n in df.items()
+        }
+
+    def scores(self, query_tokens: List[str]) -> List[float]:
+        sc = [0.0] * self.N
+        for t in set(query_tokens):
+            idf = self.idf.get(t)
+            if idf is None:
+                continue
+            for i, freq in self.postings[t]:
+                dl = self.doc_len[i] or 1
+                denom = freq + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                sc[i] += idf * freq * (self.k1 + 1) / denom
+        return sc
 
 
 def resolve_device(device: str = "auto") -> str:
@@ -158,11 +209,21 @@ class EmbeddingManager:
         self._client = None
         self._collection = None
         # Birden fazla thread'in aynı anda koleksiyon oluşturmasını engeller.
-        self._init_lock = threading.Lock()
+        # REENTRANT (RLock): clear(), kilidi tutarken _ensure_collection()'ı
+        # çağırabilir; düz Lock burada deadlock'a yol açar (clear ilk DB işlemiyse).
+        self._init_lock = threading.RLock()
 
         # Son add_chunks çağrısının süre ölçümleri (ingestion raporu için).
         self.last_embedding_time = 0.0
         self.last_chroma_write_time = 0.0
+
+        # Lexical (BM25) indeks — hibrit retrieval için. Lazy kurulur, koleksiyon
+        # her değiştiğinde (add/clear) geçersizleşir.
+        self._bm25: Optional["_BM25"] = None
+        self._lex_ids: List[str] = []
+        self._lex_docs: List[str] = []
+        self._lex_metas: List[dict] = []
+        self._lex_dirty = True
 
     # ------------------------------------------------------------------ #
     #  Veritabanı Bağlantısı (Lazy + Thread-safe)
@@ -278,6 +339,7 @@ class EmbeddingManager:
                 write_time += t2 - t1
             self.last_embedding_time = round(embedding_time, 2)
             self.last_chroma_write_time = round(write_time, 2)
+            self._lex_dirty = True  # lexical indeks yeniden kurulmalı
             logger.info("%d parça veritabanına eklendi.", len(documents))
             return len(documents)
         except Exception as exc:  # noqa: BLE001
@@ -286,11 +348,36 @@ class EmbeddingManager:
     # ------------------------------------------------------------------ #
     #  Okuma / Arama
     # ------------------------------------------------------------------ #
-    # Kosinüs mesafesi eşiği (0 = aynı, 2 = zıt). Bu değerden UZAK (büyük) parçalar
-    # alakasız kabul edilip elenir. e5 modelinde ilgili parçalar tipik olarak
-    # ~0.0-0.45 aralığında, alakasız/çöp (çizim OCR'ı vb.) ise daha büyük çıkar.
-    # Çok düşük tutarsanız hiç sonuç gelmez; çok yüksek tutarsanız çöp sızar.
-    DEFAULT_MAX_DISTANCE = 0.55
+    # Dense (kosinüs) mesafe eşiği. e5-base bu OCR'lı/çok-dilli korpusta mesafeleri
+    # ~0.19-0.25 bandına sıkıştırıyor; bu yüzden eşik bu bandın altına çekilir.
+    # Bir aday KORUNUR eğer: lexical (BM25) eşleşmesi varsa VEYA dense mesafesi
+    # bu eşiğin altındaysa. Hiçbiri yoksa (alakasız soru) boş döner -> LLM
+    # 'dokümanda bulunmuyor' demeli.
+    DEFAULT_MAX_DISTANCE = 0.22
+    RRF_K0 = 60  # Reciprocal Rank Fusion sabiti.
+    # Lexical eşleşmede yalnızca AYIRT EDİCİ terimler sayılır. idf bu eşiğin
+    # altındaki yaygın kelimeler (stopword: "ve", "nasıl", "sistem", "gemi"...)
+    # her dokümanla eşleştiği için reddetme sinyalini bozar; bu yüzden elenir.
+    IDF_FLOOR = 2.0
+
+    def _ensure_lexical(self):
+        """BM25 lexical indeksini (gerekirse) koleksiyondan kurar/yeniler."""
+        if self._bm25 is not None and not self._lex_dirty:
+            return self._bm25
+        with self._init_lock:
+            if self._bm25 is not None and not self._lex_dirty:
+                return self._bm25
+            collection = self._ensure_collection()
+            data = collection.get(include=["documents", "metadatas"])
+            self._lex_ids = data.get("ids") or []
+            self._lex_docs = data.get("documents") or []
+            self._lex_metas = data.get("metadatas") or []
+            t0 = time.perf_counter()
+            self._bm25 = _BM25([_tokenize(d) for d in self._lex_docs])
+            self._lex_dirty = False
+            logger.info("BM25 lexical indeks kuruldu: %d parça (%.1f sn).",
+                        len(self._lex_docs), time.perf_counter() - t0)
+            return self._bm25
 
     def similarity_search(
         self,
@@ -299,60 +386,96 @@ class EmbeddingManager:
         max_distance: Optional[float] = None,
     ) -> List[RetrievedContext]:
         """
-        Soruya en benzer 'k' adet bağlam parçasını döndürür.
+        HİBRİT retrieval: dense (anlamsal, e5) + lexical (BM25 anahtar kelime),
+        Reciprocal Rank Fusion (RRF) ile birleştirilir. Gürültülü/çok-dilli OCR
+        korpusunda dense tek başına ayrım yapamadığından, tam terim eşleşmesi
+        (BM25) sıralamayı ve 'alakasız soruyu reddetme' sinyalini güçlendirir.
 
-        Önce 'k'dan daha fazla aday çeker, ardından kosinüs mesafesi
-        'max_distance' eşiğinden büyük (alakasız) olanları eler ve geriye
-        kalanların en iyi 'k' tanesini döndürür. Böylece çizim OCR'ı gibi
-        anlamsız parçalar bağlama girmez. Veritabanı boşsa boş liste döner.
-
-        :param max_distance: None ise sınıf varsayılanı (DEFAULT_MAX_DISTANCE)
-                             kullanılır. Eşiği geçen parça yoksa boş liste döner
-                             (bu durumda LLM 'dokümanda bulunmuyor' demeli).
+        Bir aday KORUNUR eğer: BM25 skoru > 0 (terim eşleşti) VEYA dense mesafesi
+        <= eşik. İkisi de yoksa elenir. Hiç aday kalmazsa boş liste döner.
         """
         if not query or not query.strip():
             return []
 
         threshold = self.DEFAULT_MAX_DISTANCE if max_distance is None else max_distance
         collection = self._ensure_collection()
-
         try:
             count = collection.count()
             if count == 0:
                 return []
+            fetch_k = min(count, max(k * 6, 40))
 
-            # Eşik elemesinin işe yaraması için 'k'dan fazla aday çek.
-            fetch_k = min(count, max(k * 3, 20))
+            # --- Dense aday havuzu ---
             query_embedding = self._embedder.embed_query(query)
-            results = collection.query(
+            res = collection.query(
                 query_embeddings=[query_embedding],
                 n_results=fetch_k,
                 include=["documents", "metadatas", "distances"],
             )
+            d_ids = (res.get("ids") or [[]])[0]
+            d_docs = (res.get("documents") or [[]])[0]
+            d_metas = (res.get("metadatas") or [[]])[0]
+            d_dists = (res.get("distances") or [[]])[0]
+
+            dense_rank: Dict[str, int] = {}
+            dist_by_id: Dict[str, float] = {}
+            info_by_id: Dict[str, tuple] = {}
+            for r, (cid, doc, meta, dist) in enumerate(
+                    zip(d_ids, d_docs, d_metas, d_dists)):
+                dense_rank[cid] = r
+                dist_by_id[cid] = float(dist)
+                info_by_id[cid] = (doc, meta)
+
+            # --- Lexical (BM25) aday havuzu ---
+            bm25 = self._ensure_lexical()
+            bm_rank: Dict[str, int] = {}
+            bm_score_by_id: Dict[str, float] = {}
+            q_tokens = _tokenize(query)
+            # Yalnızca ayırt edici (yüksek idf) sorgu terimlerini kullan; yaygın
+            # kelimeler her şeyle eşleşip alakasız soruları "ilgili" gösterirdi.
+            content = [t for t in q_tokens if bm25.idf.get(t, 0.0) >= self.IDF_FLOOR]
+            if content and bm25.N:
+                scores = bm25.scores(content)
+                top = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+                r = 0
+                for i in top[:fetch_k]:
+                    if scores[i] <= 0:
+                        break
+                    cid = self._lex_ids[i]
+                    bm_rank[cid] = r
+                    bm_score_by_id[cid] = scores[i]
+                    info_by_id.setdefault(cid, (self._lex_docs[i], self._lex_metas[i]))
+                    r += 1
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Benzerlik araması başarısız: {exc}") from exc
 
-        documents = (results.get("documents") or [[]])[0]
-        metadatas = (results.get("metadatas") or [[]])[0]
-        distances = (results.get("distances") or [[]])[0]
+        # --- RRF füzyonu + reddetme kapısı ---
+        big = 10 * fetch_k
+        candidates = set(dense_rank) | set(bm_rank)
+        fused = {
+            cid: 1.0 / (self.RRF_K0 + dense_rank.get(cid, big))
+                 + 1.0 / (self.RRF_K0 + bm_rank.get(cid, big))
+            for cid in candidates
+        }
+        ordered = sorted(candidates, key=lambda c: fused[c], reverse=True)
 
         contexts: List[RetrievedContext] = []
-        for doc, meta, dist in zip(documents, metadatas, distances):
-            distance = float(dist)
-            # Eşikten uzak (alakasız) parçaları ele.
-            if distance > threshold:
-                continue
-            contexts.append(
-                RetrievedContext(
-                    text=doc,
-                    source=(meta or {}).get("source", "bilinmiyor"),
-                    page=(meta or {}).get("page", 0),
-                    score=distance,
-                )
-            )
-
-        # ChromaDB zaten mesafeye göre artan sıralı döndürür; en iyi 'k' tanesini al.
-        return contexts[:k]
+        for cid in ordered:
+            dist = dist_by_id.get(cid)
+            has_lex = bm_score_by_id.get(cid, 0.0) > 0
+            close = dist is not None and dist <= threshold
+            if not (has_lex or close):
+                continue  # ne terim eşleşmesi ne yakın dense -> alakasız
+            doc, meta = info_by_id[cid]
+            contexts.append(RetrievedContext(
+                text=doc,
+                source=(meta or {}).get("source", "bilinmiyor"),
+                page=(meta or {}).get("page", 0),
+                score=dist if dist is not None else 1.0,
+            ))
+            if len(contexts) >= k:
+                break
+        return contexts
 
     # ------------------------------------------------------------------ #
     #  Yardımcı / Yönetim
@@ -395,6 +518,8 @@ class EmbeddingManager:
                     name=self.collection_name,
                     metadata={"hnsw:space": "cosine"},
                 )
+                self._bm25 = None
+                self._lex_dirty = True
                 logger.info("Vektör veritabanı temizlendi.")
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(f"Veritabanı temizlenemedi: {exc}") from exc

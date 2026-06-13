@@ -159,8 +159,31 @@ def meaningful_len(text: str) -> int:
 
 
 # Geriye dönük/açık ad: meaningful_score == meaningful_len (yalnızca rotasyon
-# kararında kullanılır).
+# kararında kullanılır; Latin/Türkçe odaklıdır).
 meaningful_score = meaningful_len
+
+
+def is_meaningful_text(text: str, min_letters: int = 12,
+                       min_alpha_ratio: float = 0.45) -> bool:
+    """
+    Bir metnin "gerçek içerik" olup olmadığını SCRIPT-BAĞIMSIZ değerlendirir.
+    `str.isalpha()` Latin, Türkçe, Korece (Hangul), CJK vb. tüm harfleri sayar;
+    bu yüzden Korece manuel metni KORUNUR, ama sembol/rakam ağırlıklı OCR
+    gürültüsü ("@K-504 9 2 #X# Fa-07") elenir.
+
+    Kalite kapısında (gömülü çizim tespiti, chunk filtresi) kullanılır.
+    `meaningful_score`'tan farkı: o yalnızca Latin kelime-benzeri token sayar ve
+    SADECE rotasyon kararında kullanılır.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    letters = sum(1 for c in t if c.isalpha())
+    if letters < min_letters:
+        return False
+    if letters / len(t) < min_alpha_ratio:
+        return False
+    return True
 
 
 # ===========================================================================
@@ -400,20 +423,22 @@ class DocumentProcessor:
     # aşarsa yapılır (az sayfalı dosyada probe maliyeti anlamsız).
     DOMINANT_MIN_PAGES = 8
 
-    # OCR sonrası (en iyi açıda bile) anlamlı metin bu eşiğin altındaysa sayfa
-    # "manuel içine gömülü çizim/şema" sayılır: Chroma'ya EKLENMEZ, drawings_index'e
-    # yazılır. Düşük tutulur ki seyrek-metinli gerçek sayfalar elenmesin.
-    EMBEDDED_DRAWING_MIN_SCORE = 12
+    # Gömülü çizim/şema tespiti: OCR sonrası sayfa metni script-bağımsız kalite
+    # ölçütünü (is_meaningful_text: MIN_CHUNK_LETTERS + MIN_ALPHA_RATIO) geçemezse
+    # sayfa "manuel içine gömülü çizim" sayılır -> Chroma'ya EKLENMEZ, index'e yazılır.
 
     # Belge-geneli dominant rotasyon tespiti: ilk bu kadar GÜVENİLİR metinli sayfa
     # tüm açılarda taranır; sonra dominant açı belirlenir.
     ROT_PROBE_PAGES = 5   # En fazla bu kadar sayfa tam taranır.
     ROT_PROBE_MIN = 3     # Bu kadar prob sonrası net çoğunluk varsa erken karar.
 
-    # --- Chunk kalite filtresi (GEVŞETİLMİŞ) ---
-    # Eski sürümdeki agresif gibberish filtresi gerçek teknik metni de eliyordu.
-    # Artık yalnızca açıkça çöp olan (neredeyse hiç harf içermeyen) parçalar elenir.
-    MIN_ALPHA_RATIO = 0.15        # Harf oranı bunun altındaysa (saf sembol/rakam) ele.
+    # --- Chunk kalite filtresi ---
+    # Sembol/rakam ağırlıklı OCR gürültüsünü (şema/diyagram parçaları) eler;
+    # gerçek metni (Türkçe/Korece dahil) korur. Harf oranı script-bağımsızdır
+    # (isalpha CJK'yi de sayar). Çok düşük tutmak çöpü içeri alır (retrieval'i
+    # bozar), çok yüksek tutmak sayı-ağırlıklı gerçek tabloları eler -> 0.45 denge.
+    MIN_ALPHA_RATIO = 0.45        # Harf oranı bunun altındaysa (saf sembol/rakam) ele.
+    MIN_CHUNK_LETTERS = 12        # Bir parçada en az bu kadar harf olmalı.
 
     SUPPORTED_PDF = (".pdf",)
     SUPPORTED_IMAGE = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp")
@@ -745,7 +770,9 @@ class DocumentProcessor:
                 # OCR'lı bir sayfa en iyi açıda bile anlamlı metin veremiyorsa
                 # "manuel içine gömülü çizim" say: Chroma'ya ekleme, index'e yaz.
                 # (Metin katmanlı sayfalar bu kurala tabi değildir; korunur.)
-                if (ocr_used and meaningful_score(page_text) < self.EMBEDDED_DRAWING_MIN_SCORE):
+                if ocr_used and not is_meaningful_text(
+                        page_text, min_letters=self.MIN_CHUNK_LETTERS,
+                        min_alpha_ratio=self.MIN_ALPHA_RATIO):
                     # Gömülü çizim/şema: "başarısız" değil, beklenen bir durum.
                     st["embedded_drawing_pages"] += 1
                     self._append_drawings_index({
@@ -900,9 +927,18 @@ class DocumentProcessor:
     #  Görsel İşleme (OCR)
     # ------------------------------------------------------------------ #
     def _process_image(self, file_path: str) -> ProcessResult:
-        """Bir görsel dosyasını rotasyon-bilinçli OCR ile okuyup parçalar üretir."""
+        """
+        Bir görsel dosyasını OCR ile okuyup parçalar üretir.
+
+        Şema/diyagram görselleri (ad ile veya OCR sonrası anlamlı metin çok
+        düşükse) "çizim" sayılır: ana retrieval'a (Chroma'ya) EKLENMEZ, yalnızca
+        drawings_index'e yazılır. Böylece "@K-504 9 2 #X#" gibi parçalı OCR
+        gürültüsü arama kalitesini bozmaz.
+        """
         import numpy as np
         source = os.path.basename(file_path)
+        normalized_path = file_path.replace("\\", "/")
+        file_hash = file_signature(file_path)
         try:
             if Image is not None:
                 arr = np.array(Image.open(file_path).convert("RGB"))
@@ -920,12 +956,35 @@ class DocumentProcessor:
                 "embedded_drawing_pages": 0, "cache_hit_pages": 0,
                 "total_ocr_calls": best.get("calls", 1),
                 "fallback_pages": 1 if best.get("fell_back") else 0,
-                "ocr_time": 0.0, "text_time": 0.0, "dominant_rotation": None}
+                "ocr_time": 0.0, "text_time": 0.0, "dominant_rotation": None,
+                "total_chars": len(text), "total_chunks": 0, "failed_pages": []}
 
-        if not text:
-            base.update({"total_chars": 0, "total_chunks": 0, "failed_pages": [1]})
+        named_drawing = self.skip_drawings and is_drawing_file(normalized_path)
+        low_text = not is_meaningful_text(
+            text, min_letters=self.MIN_CHUNK_LETTERS, min_alpha_ratio=self.MIN_ALPHA_RATIO)
+
+        if named_drawing or low_text:
+            # Çizim/şema görseli: ana retrieval'a girmez; index'e ve (varsa) diske yaz.
+            base["embedded_drawing_pages"] = 1
+            image_path = ""
+            if self.drawings_dir and Image is not None:
+                try:
+                    ddir = os.path.join(self.drawings_dir, file_hash)
+                    os.makedirs(ddir, exist_ok=True)
+                    image_path = os.path.join(ddir, "page_001.png")
+                    Image.fromarray(arr).save(image_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Çizim görüntüsü kaydedilemedi: %s", exc)
+                    image_path = ""
+            self._append_drawings_index({
+                "source_file": source, "page": 1, "page_type": "drawing_image",
+                "ocr_skipped": named_drawing,
+                "reason": "drawing_filename_match" if named_drawing else "low_text_after_ocr",
+                "image_path": image_path,
+            })
             return ProcessResult(
-                success=False, message=f"'{source}' görselinde metin bulunamadı.",
+                success=True,
+                message=f"'{source}': şema/çizim görseli — ana aramaya eklenmedi.",
                 stats=base,
             )
 
@@ -935,8 +994,7 @@ class DocumentProcessor:
                           ocr_used=True, rotation=best["rotation"], char_count=len(piece))
             for idx, piece in enumerate(pieces)
         ]
-        base.update({"total_chars": len(text), "total_chunks": len(chunks),
-                     "failed_pages": []})
+        base["total_chunks"] = len(chunks)
         return ProcessResult(
             chunks=chunks, success=True,
             message=f"'{source}' OCR ile okundu: {len(chunks)} parça.", stats=base,
@@ -965,18 +1023,15 @@ class DocumentProcessor:
 
     def _is_garbage(self, text: str) -> bool:
         """
-        Sadece AÇIKÇA çöp parçaları eler (eski agresif filtre kaldırıldı).
-        Çöp = çok kısa, ya da neredeyse hiç harf içermeyen (saf sembol/rakam).
+        Açıkça çöp parçaları eler: çok kısa, ya da sembol/rakam ağırlıklı
+        (script-bağımsız harf oranı düşük) OCR gürültüsü. Gerçek metin (Türkçe/
+        Korece dahil) korunur.
         """
         t = text.strip()
         if len(t) < self.min_chunk_chars:
             return True
-        letters = sum(1 for c in t if c.isalpha())
-        if letters == 0:
-            return True
-        if letters / len(t) < self.MIN_ALPHA_RATIO:
-            return True
-        return False
+        return not is_meaningful_text(
+            t, min_letters=self.MIN_CHUNK_LETTERS, min_alpha_ratio=self.MIN_ALPHA_RATIO)
 
     # ------------------------------------------------------------------ #
     #  Çizim Atlama İndeksi

@@ -33,6 +33,15 @@ import time
 import argparse
 import logging
 
+# Konsol kodlamasını UTF-8'e sabitle. Aksi halde Türkçe Windows konsolu (cp1254),
+# dosya adındaki egzotik karakterleri (ör. Kiril 'М' U+041C) yazamayıp tüm içe
+# aktarmayı UnicodeEncodeError ile çökertir. errors='replace' = asla çökme.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # Python 3.7+
+    except Exception:  # noqa: BLE001
+        pass
+
 # Embedding modeli lokalse Hugging Face'i çevrimdışına al (uygulamayla aynı).
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
