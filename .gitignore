@@ -19,6 +19,9 @@ Instructions.rar
 # Lokale indirilen / gömülen embedding modelleri
 models/
 
+# Gömülen EasyOCR modelleri (.pth ~98 MB) - pakete spec ile eklenir
+easyocr_models/
+
 # PyInstaller çıktıları
 build/
 dist/

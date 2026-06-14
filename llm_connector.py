@@ -29,6 +29,51 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+# LaTeX komut -> düz sembol eşlemesi (model promptu yok sayıp LaTeX üretirse).
+_LATEX_SYMBOLS = {
+    r"\times": "×", r"\cdot": "·", r"\div": "÷", r"\pm": "±", r"\mp": "∓",
+    r"\rightarrow": "→", r"\leftarrow": "←", r"\Rightarrow": "⇒", r"\to": "→",
+    r"\leq": "≤", r"\geq": "≥", r"\neq": "≠", r"\approx": "≈", r"\equiv": "≡",
+    r"\degree": "°", r"\circ": "°", r"\alpha": "α", r"\beta": "β", r"\delta": "Δ",
+    r"\Delta": "Δ", r"\sum": "Σ", r"\sqrt": "√", r"\infty": "∞",
+}
+
+
+def clean_markdown(text: str) -> str:
+    """
+    Modelin (system prompt'a rağmen) ürettiği ham Markdown VE LaTeX işaretlerini
+    temizler; arayüz düz metin gösterdiğinden bunlar çirkin/okunaksız görünür.
+    - Satır başı ATX başlıkları (#, ##, ...) kaldırılır.
+    - '* ' / '- ' madde işaretleri '• ' yapılır; '**' (kalın) silinir.
+    - LaTeX: \\boxed{x} -> x; \\[ \\] \\( \\) ve $...$ matematik sınırlayıcıları
+      kaldırılır; yaygın komutlar sembole çevrilir; kalan \\komut'lar silinir.
+    """
+    if not text:
+        return text
+    # --- Markdown ---
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s{0,3}[*\-]\s+", "• ", text, flags=re.MULTILINE)
+    text = text.replace("**", "")
+    # --- LaTeX ---
+    # \boxed{4} / \text{...} gibi tek argümanlı sarmalayıcılar -> içeriği kalsın.
+    text = re.sub(r"\\(?:boxed|text|mathrm|mathbf|mathit|operatorname)\s*\{([^{}]*)\}",
+                  r"\1", text)
+    # Matematik sınırlayıcıları: \[ \] \( \) ve $...$ / $$...$$.
+    text = re.sub(r"\\[\[\]\(\)]", "", text)
+    text = text.replace("$$", "").replace("$", "")
+    # Yaygın komutları sembole çevir.
+    for cmd, sym in _LATEX_SYMBOLS.items():
+        text = text.replace(cmd, sym)
+    # Kalan \komut'ları (frac, left, right, displaystyle vb.) sil.
+    text = re.sub(r"\\[a-zA-Z]+", "", text)
+    # LaTeX kaçışlı süslü parantezleri düzelt.
+    text = text.replace(r"\{", "{").replace(r"\}", "}")
+    # Çoklu boş satırları sadeleştir.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
 # Gömülü motor (llama-cpp-python) CUDA wheel'i, CUDA runtime DLL'lerine (cudart,
 # cublas, cublasLt) ihtiyaç duyar. Bu DLL'ler torch'un CUDA sürümüyle 'torch/lib'
 # içinde gelir (önerilen kurulum); torch CPU kullanılıyorsa 'nvidia-*-cu12' pip
@@ -124,6 +169,14 @@ SYSTEM_PROMPT = (
     "Alakasız bağlamı soruyu yanıtlıyormuş gibi SUNMA, ondan değer/prosedür uydurma. "
     "İstersen ardından 'GENEL MÜHENDİSLİK BİLGİSİ (dokümanda doğrulanmadı):' "
     "başlığıyla genel bilgi verebilirsin; ama bunun dokümana dayanmadığını belirt.\n"
+    "4c. DENİZ DİZEL TERMİNOLOJİSİ: Genel mühendislik bilgisi verirken soru 2 "
+    "zamanlı gemi ana makinesi, marine diesel engine veya main engine ile "
+    "ilgiliyse, benzinli/otomotiv motorlarına ait 'ateşleme sistemi (ignition)', "
+    "'buji', 'yakıt karışımı (air-fuel mixture)' gibi ifadeleri KULLANMA. Bunun "
+    "yerine deniz dizel terminolojisini kullan: fuel injection, injector, fuel "
+    "pump, exhaust valve, scavenge air, turbocharger, air cooler, cylinder liner, "
+    "piston rings, compression, indicator card, exhaust gas temperature deviation. "
+    "Spesifik değer uydurma.\n"
     "5. Mümkün olduğunda maddeler ve gerekiyorsa adım adım açıkla. "
     "Güvenlikle ilgili konularda dikkatli ve net ol.\n"
     "6. BİÇİM: DÜZ METİN yaz. Markdown işaretlerini (**kalın**, #, ##, ###, "
@@ -165,7 +218,12 @@ class BaseLLMConnector(ABC):
     """Tüm LLM sağlayıcılarının uygulaması gereken ortak arayüz."""
 
     @abstractmethod
-    def generate(self, prompt: str) -> LLMResponse:
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.3,
+    ) -> LLMResponse:
         """Verilen tam prompt için bir cevap üretir."""
         raise NotImplementedError
 
@@ -245,12 +303,37 @@ class GeminiConnector(BaseLLMConnector):
                 return name
         return sorted(available)[0]
 
-    def generate(self, prompt: str) -> LLMResponse:
+    def _generate_content(self, client, prompt: str,
+                          max_tokens: Optional[int], temperature: float):
+        """
+        generate_content çağrısını üretim parametreleriyle (temperature,
+        max_output_tokens) yapar. SDK sürümü config'i desteklemiyorsa veya
+        parametre uyumsuzluğu olursa parametresiz çağrıya güvenli biçimde düşer.
+        """
         try:
-            client = self._get_client()
-            response = client.models.generate_content(
+            from google.genai import types
+            kwargs = {"temperature": temperature}
+            if max_tokens:
+                kwargs["max_output_tokens"] = max_tokens
+            cfg = types.GenerateContentConfig(**kwargs)
+            return client.models.generate_content(
+                model=self.model_name, contents=prompt, config=cfg
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Gemini config'li çağrı başarısız, parametresiz fallback: %s", exc)
+            return client.models.generate_content(
                 model=self.model_name, contents=prompt
             )
+
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.3,
+    ) -> LLMResponse:
+        try:
+            client = self._get_client()
+            response = self._generate_content(client, prompt, max_tokens, temperature)
             text = (getattr(response, "text", "") or "").strip()
             if not text:
                 return LLMResponse("", success=False, error="Gemini boş cevap döndürdü.")
@@ -266,8 +349,8 @@ class GeminiConnector(BaseLLMConnector):
                     self.model_name = resolved
                     try:
                         client = self._get_client()
-                        response = client.models.generate_content(
-                            model=self.model_name, contents=prompt
+                        response = self._generate_content(
+                            client, prompt, max_tokens, temperature
                         )
                         text = (getattr(response, "text", "") or "").strip()
                         if text:
@@ -324,9 +407,11 @@ class LocalLLMConnector(BaseLLMConnector):
     kullanıldığında model tekrar yüklenmez.
     """
 
-    # Bağlam penceresi: RAG promptu (sistem + 8 bağlam parçası + soru) sığmalı.
-    DEFAULT_N_CTX = 8192
-    MAX_OUTPUT_TOKENS = 2048
+    # Bağlam penceresi: RAG promptu (sistem + bağlam parçaları + soru) sığmalı.
+    # 8 GB VRAM'de 8192 context, KV cache'i büyütür. TOP_K=5 ile 6144 çoğu RAG
+    # cevabı için yeterlidir; gerekirse ileride ayara taşınabilir.
+    DEFAULT_N_CTX = 6144
+    MAX_OUTPUT_TOKENS = 1024
 
     def __init__(
         self,
@@ -375,7 +460,12 @@ class LocalLLMConnector(BaseLLMConnector):
             self._llm = Llama(**common)
         return self._llm
 
-    def generate(self, prompt: str) -> LLMResponse:
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.3,
+    ) -> LLMResponse:
         try:
             llm = self._get_llm()
         except (ImportError, FileNotFoundError) as exc:
@@ -392,7 +482,7 @@ class LocalLLMConnector(BaseLLMConnector):
             stream = llm.create_chat_completion(
                 messages=[{"role": "user", "content": prompt}],
                 stream=True,
-                temperature=0.3,
+                temperature=temperature,
                 top_p=0.9,
                 top_k=40,
                 # Küçük modellerin düştüğü tekrar (kelime/cümle döngüsü)
@@ -400,7 +490,7 @@ class LocalLLMConnector(BaseLLMConnector):
                 repeat_penalty=1.18,
                 frequency_penalty=0.4,
                 presence_penalty=0.3,
-                max_tokens=self.MAX_OUTPUT_TOKENS,
+                max_tokens=max_tokens or self.MAX_OUTPUT_TOKENS,
             )
             parts: List[str] = []
             for chunk in stream:
@@ -560,10 +650,14 @@ class LLMConnector:
         if self._connector is None:
             return LLMResponse(
                 "", success=False,
-                error="Önce bir model sağlayıcı seçin (Gemini veya Ollama).",
+                error="Önce bir model sağlayıcı seçin (Gemini veya Yerel Model).",
             )
         prompt = self.build_prompt(question, contexts)
-        return self._connector.generate(prompt)
+        resp = self._connector.generate(prompt)
+        # Modelin ham Markdown işaretlerini temizle (arayüz düz metin gösterir).
+        if getattr(resp, "success", False) and resp.text:
+            resp.text = clean_markdown(resp.text)
+        return resp
 
     def translate_to_english(self, text: str) -> str:
         """
@@ -580,7 +674,8 @@ class LLMConnector:
             "explanation.\n\nTurkish: " + text.strip() + "\nEnglish:"
         )
         try:
-            resp = self._connector.generate(prompt)
+            # Çeviri kısa bir üretimdir; düşük sıcaklık + küçük token bütçesi hız için.
+            resp = self._connector.generate(prompt, max_tokens=96, temperature=0.0)
             if not getattr(resp, "success", False):
                 return ""
             lines = [ln.strip() for ln in (resp.text or "").splitlines() if ln.strip()]

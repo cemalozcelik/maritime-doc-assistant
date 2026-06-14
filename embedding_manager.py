@@ -87,23 +87,69 @@ _TR_EN_TERMS = {
 }
 
 
+# Gevşek (loose) kök sözlüğü: Türkçe çekim ekleri ("makinesini", "sıcaklıkları")
+# kelimeyi bozmadan KÖK üzerinden eşleştirmek için. replace YAPMAYIZ; sadece
+# sorguda kök geçiyorsa İngilizce terimi EK olarak listeye alırız. Böylece
+# "ana makinesini -> main enginesini" gibi bozuk üretim imkânsızdır.
+_TR_EN_STEMS = {
+    "makine": "main engine", "egzoz": "exhaust gas", "sıcak": "temperature",
+    "silindir": "cylinder", "yakıt": "fuel injection", "enjekt": "injector",
+    "püskürt": "injection", "basın": "pressure", "kompres": "compressor",
+    "kazan": "boiler", "inciner": "incinerator", "separat": "separator purifier",
+    "scavenge": "scavenge air", "turbo": "turbocharger", "valf": "valve",
+    "supap": "valve", "pompa": "pump", "alarm": "alarm", "sapma": "deviation",
+    "fark": "deviation",
+}
+
+
 def expand_query_tr_en(query: str) -> List[str]:
     """
-    Sorgunun TR teknik terimlerini EN karşılıklarıyla değiştirip ek bir varyant
-    döndürür. Sonuç: [orijinal] veya [orijinal, ingilizce_varyant].
+    Türkçe sorguyu KORUYARAK, ona İngilizce teknik terimlerden oluşan ikinci bir
+    varyant ekler. Metin içinde ASLA replace yapılmaz (Türkçe çekim ekleri bozuk
+    İngilizce üretirdi: "ana makinesini" -> "main enginesini"). Bunun yerine
+    eşleşen TR terimlerin/köklerin İngilizce karşılıkları sorgunun SONUNA eklenir.
+
+    Sonuç: [orijinal] veya [orijinal, "orijinal + en_terimler"].
     """
     if not query or not query.strip():
         return [query] if query else []
-    low = " " + query.lower() + " "
-    en = low
-    for tr, eng in sorted(_TR_EN_TERMS.items(), key=lambda kv: -len(kv[0])):
-        if tr in en:
-            en = en.replace(tr, eng)
-    en = _WS_RE.sub(" ", en).strip()
-    variants = [query]
-    if en and en != low.strip():
-        variants.append(en)
-    return variants
+    low = query.lower()
+
+    # (pozisyon, en_ifade): pozisyon, çıktı sırasını sorgudaki sıraya yaklaştırır.
+    hits: List[Tuple[int, str]] = []
+    for tr, eng in _TR_EN_TERMS.items():
+        pos = low.find(tr)
+        if pos >= 0:
+            hits.append((pos, eng))
+    for stem, eng in _TR_EN_STEMS.items():
+        pos = low.find(stem)
+        if pos >= 0:
+            hits.append((pos, eng))
+    hits.sort(key=lambda x: x[0])
+
+    # İfade bazında tekilleştir (ilk görüleni tut).
+    phrases: List[str] = []
+    for _pos, eng in hits:
+        if eng not in phrases:
+            phrases.append(eng)
+
+    # Kısa ifade, daha uzun bir ifadenin içinde ARDIŞIK kelime dizisiyse ele
+    # (ör. "exhaust" ⊂ "exhaust gas" -> "exhaust"i at). Tekrar/gürültüyü azaltır.
+    def _covered(short: str, others: List[str]) -> bool:
+        sw = short.split()
+        for other in others:
+            if other == short:
+                continue
+            ow = other.split()
+            for i in range(len(ow) - len(sw) + 1):
+                if ow[i:i + len(sw)] == sw:
+                    return True
+        return False
+
+    phrases = [p for p in phrases if not _covered(p, phrases)]
+    if not phrases:
+        return [query]
+    return [query, query + " " + " ".join(phrases)]
 
 
 def _norm_for_dedup(text: str) -> str:
@@ -117,6 +163,19 @@ def _norm_for_dedup(text: str) -> str:
     t = _NUM_RE.sub("", text.lower())
     t = _PUNCT_RE.sub(" ", t)
     return _WS_RE.sub(" ", t).strip()
+
+
+def _is_low_quality_ocr(text: str) -> bool:
+    """
+    Çok bozuk / anlamsız OCR parçasını (LLM'i yanıltmasın diye) eler.
+    Agresif olmamalı: yalnızca çok kısa (<40 karakter) ya da harf oranı çok düşük
+    (<%30, yani ağırlıkla simge/sayı/gürültü) metinleri düşük kaliteli sayar.
+    """
+    if not text or len(text.strip()) < 40:
+        return True
+    letters = sum(ch.isalpha() for ch in text)
+    total = max(len(text), 1)
+    return (letters / total) < 0.30
 
 
 class _BM25:
@@ -457,15 +516,17 @@ class EmbeddingManager:
     # ------------------------------------------------------------------ #
     #  Okuma / Arama
     # ------------------------------------------------------------------ #
-    # Dense (kosinüs) mesafe eşiği. e5-base bu OCR'lı/çok-dilli korpusta mesafeleri
-    # ~0.19-0.25 bandına sıkıştırıyor; bu yüzden eşik bu bandın altına çekilir.
-    # Bir aday KORUNUR eğer: lexical (BM25) eşleşmesi varsa VEYA dense mesafesi
-    # bu eşiğin altındaysa. Hiçbiri yoksa (alakasız soru) boş döner -> LLM
-    # 'dokümanda bulunmuyor' demeli.
-    # bge-m3 ölçeği: ilgili parçalar tipik olarak ~0.30-0.48, alakasız ~0.50+.
-    # 0.50 recall-güvenli (gerçek sorular kırılmaz); pizza/film gibi tamamen
-    # alakasızlar elenir. Hibrit lexical sinyal sıralamayı ayrıca güçlendirir.
+    # Dense (kosinüs) mesafe eşiği — bge-m3 için kalibre.
+    # bge-m3 ile bu korpusta gerçek teknik sonuçlar genelde 0.35-0.48, alakasızlar
+    # çoğunlukla 0.49+ bandında görülmüştür. 0.48 mevcut test setinde dengeli bir
+    # eşiktir; YENİ korpuslarda tekrar kalibre edilmelidir.
+    # Bir aday KORUNUR eğer: dense mesafe <= eşik (yakın) VEYA gri alanda
+    # (eşik + LEXICAL_RELAX_MARGIN) olup güçlü BM25 lexical eşleşmesi varsa.
     DEFAULT_MAX_DISTANCE = 0.48
+    # Gri alan payı: dense biraz yüksek ama lexical (BM25) güçlüyse kabul için.
+    # BM25 artık alakasız soruya TEK BAŞINA kapı açan gate DEĞİL; yalnızca dense'in
+    # eşiğe yakın (gri alan) adaylarını kurtaran yardımcı sinyaldir.
+    LEXICAL_RELAX_MARGIN = 0.04
     RRF_K0 = 60  # Reciprocal Rank Fusion sabiti.
     # Lexical eşleşmede yalnızca AYIRT EDİCİ terimler sayılır. idf bu eşiğin
     # altındaki yaygın kelimeler (stopword: "ve", "nasıl", "sistem", "gemi"...)
@@ -503,8 +564,10 @@ class EmbeddingManager:
         korpusunda dense tek başına ayrım yapamadığından, tam terim eşleşmesi
         (BM25) sıralamayı ve 'alakasız soruyu reddetme' sinyalini güçlendirir.
 
-        Bir aday KORUNUR eğer: BM25 skoru > 0 (terim eşleşti) VEYA dense mesafesi
-        <= eşik. İkisi de yoksa elenir. Hiç aday kalmazsa boş liste döner.
+        Bir aday KORUNUR eğer: dense mesafesi <= eşik (yakın) VEYA gri alanda
+        (eşik + LEXICAL_RELAX_MARGIN) olup BM25 lexical eşleşmesi varsa. İkisi de
+        yoksa elenir; ayrıca çok bozuk OCR parçaları da elenir. Hiç aday kalmazsa
+        boş liste döner (-> LLM 'dokümanda bulunmuyor' demeli).
         """
         if not query or not query.strip():
             return []
@@ -578,10 +641,19 @@ class EmbeddingManager:
         for cid in ordered:
             dist = dist_by_id.get(cid)
             has_lex = bm_score_by_id.get(cid, 0.0) > 0
+            # Yakın dense her zaman kabul. BM25 ise YALNIZCA gri alanda
+            # (eşik + LEXICAL_RELAX_MARGIN) kurtarıcı olur; tek başına yaygın bir
+            # terimle alakasız soruya kapı açamaz.
             close = dist is not None and dist <= threshold
-            if not (has_lex or close):
-                continue  # ne terim eşleşmesi ne yakın dense -> alakasız
+            lexical_relaxed = (
+                has_lex and dist is not None
+                and dist <= threshold + self.LEXICAL_RELAX_MARGIN
+            )
+            if not (close or lexical_relaxed):
+                continue  # ne yakın dense ne de gri alanda lexical -> alakasız
             doc, meta = info_by_id[cid]
+            if _is_low_quality_ocr(doc):
+                continue  # çok bozuk OCR parçası LLM'i yanıltmasın
             contexts.append(RetrievedContext(
                 text=doc,
                 source=(meta or {}).get("source", "bilinmiyor"),

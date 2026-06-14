@@ -87,11 +87,18 @@ datas, _d2 = _strip_useless(datas)
 print(f"[spec] Gereksiz .lib/.pdb dosyalari cikarildi: {_d1 + _d2} adet")
 
 # ----------------------------------------------------------------------------
-#  İSTEĞE BAĞLI: Embedding modelini .exe içine gömmek isterseniz, modeli
-#  'models/intfloat_multilingual-e5-base' klasörüne indirip aşağıyı açın.
-#  Böylece uygulama internetsiz ilk açılışta bile modeli bulur.
+#  DAĞITIM: yalnızca embedding modeli (bge-m3) pakete gömülür. Bu model torch<2.6
+#  ile .bin yükleyemediği (CVE-2025-32434) için safetensors olarak gömülmesi en
+#  güvenli yoldur; ayrıca ~2.3 GB'lık indirmeyi de baştan halleder.
+#  GGUF (LLM) ve EasyOCR modelleri GÖMÜLMEZ; ilk kullanımda internetten iner
+#  (GGUF: İndirilenler sekmesi; EasyOCR: ilk OCR'da otomatik). bkz.
+#  local_embedding_model_path (main.py) ve _bundled_easyocr_dir (document_processor.py
+#  -> gömülü model yoksa EasyOCR varsayılan indirme davranışına düşer).
 # ----------------------------------------------------------------------------
-# datas += [("models", "models")]
+if _os.path.isdir("models"):
+    datas += [("models", "models")]          # bge-m3 (safetensors, ~2.3 GB)
+else:
+    print("[spec] UYARI: 'models/' yok -> embedding modeli pakete gomulmeyecek!")
 
 
 a = Analysis(

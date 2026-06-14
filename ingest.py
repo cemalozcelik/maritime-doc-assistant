@@ -33,6 +33,8 @@ import time
 import argparse
 import logging
 
+import torch
+
 # Konsol kodlamasını UTF-8'e sabitle. Aksi halde Türkçe Windows konsolu (cp1254),
 # dosya adındaki egzotik karakterleri (ör. Kiril 'М' U+041C) yazamayıp tüm içe
 # aktarmayı UnicodeEncodeError ile çökertir. errors='replace' = asla çökme.
@@ -138,6 +140,7 @@ def main() -> None:
         model_name_or_path=_resolve_model(EMBEDDING_MODEL),
         persist_directory=os.path.join(data_dir, "vector_store"),
         collection_name="gemi_dokumanlari",
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
     print(f"Mod: {args.ingest_mode} | DPI: {proc.ocr_dpi} | "

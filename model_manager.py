@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 # approx_mb gerçek dosya boyutu; min_ram önerilen boş RAM (GPU'ya tam sığması için
 # yaklaşık aynı VRAM gerekir). Bu liste yalnızca "hızlı seçim"dir; tüm güncel
 # modellere 'İndirilenler' sekmesindeki arama/manuel giriş ile erişilebilir.
+# NOT: Gömülü motor llama-cpp-python 0.3.4'tür. Qwen3 (yeni mimari) ve phi-4
+# (sliding-window attention) bu sürümle YÜKLENMEZ; phi-4 ayrıca süreci abort ile
+# çökertir. Bu yüzden curated listeden çıkarıldılar. Motor yükseltilirse geri eklenebilir.
 CURATED_MODELS: List[Dict] = [
     {
         "key": "qwen2.5-0.5b",
@@ -90,14 +93,6 @@ CURATED_MODELS: List[Dict] = [
         "note": "Akıl yürütmede güçlü; Türkçesi orta.",
     },
     {
-        "key": "qwen3-4b",
-        "label": "Qwen3 4B Instruct (2507, güncel)",
-        "repo_id": "unsloth/Qwen3-4B-Instruct-2507-GGUF",
-        "filename": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-        "approx_mb": 2382, "params": "4B", "quant": "Q4_K_M", "min_ram": "5 GB",
-        "note": "Yeni nesil; boyutuna göre çok yetenekli.",
-    },
-    {
         "key": "mistral-7b-v03",
         "label": "Mistral 7B Instruct v0.3",
         "repo_id": "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
@@ -130,14 +125,6 @@ CURATED_MODELS: List[Dict] = [
         "note": "Genel amaçlı güçlü model.",
     },
     {
-        "key": "qwen3-8b",
-        "label": "Qwen3 8B (güncel, düşünen)",
-        "repo_id": "bartowski/Qwen_Qwen3-8B-GGUF",
-        "filename": "Qwen_Qwen3-8B-Q4_K_M.gguf",
-        "approx_mb": 4795, "params": "8B", "quant": "Q4_K_M", "min_ram": "8 GB",
-        "note": "Yeni nesil; adım adım düşünür, kaliteli ama biraz yavaş.",
-    },
-    {
         "key": "gemma2-9b",
         "label": "Gemma 2 9B Instruct",
         "repo_id": "bartowski/gemma-2-9b-it-GGUF",
@@ -154,14 +141,6 @@ CURATED_MODELS: List[Dict] = [
         "note": "Yüksek kalite. 12 GB+ VRAM veya bol RAM gerekir.",
     },
     {
-        "key": "phi-4",
-        "label": "Phi-4 (14B)",
-        "repo_id": "bartowski/phi-4-GGUF",
-        "filename": "phi-4-Q4_K_M.gguf",
-        "approx_mb": 8634, "params": "14B", "quant": "Q4_K_M", "min_ram": "12 GB",
-        "note": "Akıl yürütmede çok güçlü. 12 GB+ gerekir.",
-    },
-    {
         "key": "mistral-small-22b",
         "label": "Mistral Small Instruct (22B, 2409)",
         "repo_id": "bartowski/Mistral-Small-Instruct-2409-GGUF",
@@ -176,22 +155,6 @@ CURATED_MODELS: List[Dict] = [
         "filename": "gemma-2-27b-it-Q4_K_M.gguf",
         "approx_mb": 15874, "params": "27B", "quant": "Q4_K_M", "min_ram": "20 GB",
         "note": "Çok kaliteli ama ağır. 20 GB+ VRAM/RAM gerekir.",
-    },
-    {
-        "key": "qwen3-30b-a3b",
-        "label": "Qwen3 30B-A3B Instruct (2507, MoE)",
-        "repo_id": "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-        "filename": "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-        "approx_mb": 17715, "params": "30B (3B aktif)", "quant": "Q4_K_M", "min_ram": "22 GB",
-        "note": "Uzman karışımı (MoE): 30B kalite, sadece 3B aktif olduğu için hızlı. Bol RAM'de ideal.",
-    },
-    {
-        "key": "qwen3-32b",
-        "label": "Qwen3 32B (güncel, düşünen)",
-        "repo_id": "bartowski/Qwen_Qwen3-32B-GGUF",
-        "filename": "Qwen_Qwen3-32B-Q4_K_M.gguf",
-        "approx_mb": 18842, "params": "32B", "quant": "Q4_K_M", "min_ram": "24 GB",
-        "note": "Yeni nesil yüksek kalite. 24 GB+ gerekir.",
     },
     {
         "key": "qwen2.5-32b",

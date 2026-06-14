@@ -106,7 +106,7 @@ from ui_components import (  # noqa: E402
     ChatHistoryRail, ChatArea, ModelsView, DownloadsView, SettingsView,
 )
 from document_processor import DocumentProcessor, format_ingestion_report  # noqa: E402
-from embedding_manager import EmbeddingManager  # noqa: E402
+from embedding_manager import EmbeddingManager, expand_query_tr_en  # noqa: E402
 from llm_connector import LLMConnector  # noqa: E402
 from model_manager import ModelManager  # noqa: E402
 from chat_store import ChatStore, ROLE_USER, ROLE_ASSISTANT  # noqa: E402
@@ -149,15 +149,36 @@ def writable_data_dir() -> str:
         return fallback
 
 
+def app_base_dir() -> str:
+    """
+    Uygulamanın kök klasörü: paketlenmişse (.exe) çalıştırılabilirin yanındaki
+    klasör, geliştirmede kaynak dosyanın klasörü. resource_path (_MEIPASS) geçici
+    açılım klasörünü gösterir; bu ise kalıcı kurulum klasörüdür.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def local_embedding_model_path(model_name: str) -> str:
     """
-    Embedding modeli için önce paketli/lokal klasörü, yoksa model adını döndürür.
+    Embedding modeli için lokal klasörü sırayla arar; bulunamazsa HF model adını
+    döndürür (ilk çalıştırmada internetten indirilebilsin). Aday sırası:
+      1) _MEIPASS/models/<safe>      (pakete gömülü, salt-okunur)
+      2) <exe veya proje>/models/<safe>  (kurulum klasörünün yanı)
+      3) <yazılabilir veri>/models/<safe>  (kullanıcının indirdiği)
     """
     safe_name = model_name.replace("/", "_")
-    candidate = resource_path(os.path.join("models", safe_name))
-    if os.path.isdir(candidate):
-        logger.info("Lokal embedding modeli bulundu: %s", candidate)
-        return candidate
+    rel = os.path.join("models", safe_name)
+    candidates = [
+        resource_path(rel),
+        os.path.join(app_base_dir(), rel),
+        os.path.join(writable_data_dir(), rel),
+    ]
+    for cand in candidates:
+        if os.path.isdir(cand):
+            logger.info("Lokal embedding modeli bulundu: %s", cand)
+            return cand
     return model_name
 
 
@@ -174,7 +195,15 @@ class GemiAsistaniApp(*_APP_BASES):
     """Uygulamanın ana penceresi ve koordinatörü."""
 
     EMBEDDING_MODEL = "BAAI/bge-m3"
-    TOP_K = 8  # Her soruda kaç bağlam parçası getirilsin (eşik elemesinden sonra).
+    # Her soruda kaç bağlam parçası getirilsin (eşik elemesinden sonra). 8 yerine 5:
+    # daha az bağlam = küçük/orta yerel LLM daha az dağılır, bozuk OCR/başlık
+    # parçasının cevaba sızma olasılığı azalır, üretim de hızlanır.
+    TOP_K = 5
+    # Debug: "dokümanda bulunmuyor" durumunda bile değerlendirilen kaynakları göster.
+    DEBUG_SOURCES = False
+    # Kayıtlı seçim yoksa varsayılan aktif model tercih sırası (indirilmiş olanlar
+    # arasından ilk eşleşen seçilir). Qwen2.5-7B: 8 GB GPU'da hız/kalite dengesi.
+    DEFAULT_MODEL_PREFS = ("Qwen2.5-7B-Instruct-Q4_K_M.gguf",)
 
     def __init__(self) -> None:
         super().__init__()
@@ -210,6 +239,11 @@ class GemiAsistaniApp(*_APP_BASES):
             models_dir=os.path.join(data_dir, "models_gguf")
         )
         self.chat_store = ChatStore(base_dir=os.path.join(data_dir, "chats"))
+
+        # Basit kalıcı ayarlar (seçili aktif model vb.). Açılışta okunur; model
+        # seçilince/indirilince yazılır. Böylece aktif model yeniden başlatmada korunur.
+        self._settings_path = os.path.join(data_dir, "settings.json")
+        self._settings = self._load_settings()
 
         # --- Thread <-> UI iletişimi için kuyruk ---
         self._ui_queue: "queue.Queue" = queue.Queue()
@@ -469,13 +503,53 @@ class GemiAsistaniApp(*_APP_BASES):
     def _on_select_model(self, filename: str) -> None:
         """Aktif yerel modeli ayarlar (henüz yüklemez; ilk soruda yüklenir)."""
         self.rail.set_status(f"Aktif model: {filename}", "gray70")
+        # Kullanıcının seçimini kalıcı yap (yeniden başlatmada korunsun).
+        if filename and not filename.startswith("("):
+            self._settings["active_model"] = filename
+            self._save_settings()
+
+    def _preferred_active_model(self, downloaded: List[str]) -> Optional[str]:
+        """
+        Açılışta seçili gelecek modeli belirler: 1) kayıtlı seçim (hâlâ varsa),
+        2) DEFAULT_MODEL_PREFS tercih sırası, 3) listedeki ilk model.
+        """
+        if not downloaded:
+            return None
+        saved = self._settings.get("active_model")
+        if saved and saved in downloaded:
+            return saved
+        for pref in self.DEFAULT_MODEL_PREFS:
+            if pref in downloaded:
+                return pref
+        return downloaded[0]
 
     def _refresh_model_lists(self) -> None:
         """Modeller görünümündeki indirilmiş ve indirilebilir listeleri tazeler."""
         downloaded = self.model_manager.list_downloaded()
         active = self.models_view.get_active_model()
+        # Geçerli bir seçim yoksa (ilk açılış / silinmiş model) tercih sırasına düş.
+        if not active or active.startswith("(") or active not in downloaded:
+            active = self._preferred_active_model(downloaded)
         self.models_view.set_downloaded_models(downloaded, active=active)
         self.downloads_view.set_curated(self.model_manager.curated(), downloaded)
+
+    def _load_settings(self) -> dict:
+        """settings.json'u okur (yoksa boş sözlük)."""
+        try:
+            import json
+            with open(self._settings_path, encoding="utf-8") as fh:
+                return json.load(fh) or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _save_settings(self) -> None:
+        """Ayarları settings.json'a yazar (hata olsa da uygulamayı bozmaz)."""
+        try:
+            import json
+            with open(self._settings_path, "w", encoding="utf-8") as fh:
+                json.dump(self._settings, fh, ensure_ascii=False, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Ayarlar kaydedilemedi: %s", exc)
 
     def _set_ready_status(self) -> None:
         """Durum çubuğunu 'hazır' (parça sayısıyla) durumuna döndürür."""
@@ -595,6 +669,9 @@ class GemiAsistaniApp(*_APP_BASES):
                 self.models_view.set_downloaded_models(
                     self.model_manager.list_downloaded(), active=model["filename"]
                 )
+                # İndirilen modeli kalıcı aktif seçim yap.
+                self._settings["active_model"] = model["filename"]
+                self._save_settings()
 
         self._run_in_background(task, on_done=done)
 
@@ -839,31 +916,35 @@ class GemiAsistaniApp(*_APP_BASES):
         def task():
             from perf_monitor import ResourceSampler, format_perf_block
 
-            # Çapraz-dil için sorguyu İngilizce'ye çevir (korpus ağırlıklı İngilizce);
-            # TR + EN varyantlarını multi-query RRF ile birlikte ara. Çeviri
-            # başarısızsa sözlük-tabanlı genişletmeye düşülür (offline güvenli).
-            queries = [question]
-            try:
-                en = self.llm.translate_to_english(question)
-                if en and en.strip().lower() != question.strip().lower():
-                    queries.append(en)
-            except Exception:  # noqa: BLE001
-                pass
-            if len(queries) == 1:  # çeviri yok -> sözlükle genişlet
-                from embedding_manager import expand_query_tr_en
-                queries = expand_query_tr_en(question)
-
             with ResourceSampler() as sampler:
                 t0 = time.perf_counter()
+                # 1) Sorgu varyantları: sözlük-tabanlı TR->EN genişletme (offline,
+                #    hızlı). Yalnızca Gemini'de ek olarak LLM çevirisi yapılır;
+                #    yerel modelde çeviri çağrısı YOK (her soruda yavaşlatıyordu).
+                queries = expand_query_tr_en(question)
+                if self.models_view.get_provider().startswith("Gemini"):
+                    try:
+                        en = self.llm.translate_to_english(question)
+                        if en and en.strip().lower() != question.strip().lower():
+                            queries.append(en)
+                    except Exception:  # noqa: BLE001
+                        pass
+                queries = list(dict.fromkeys([q for q in queries if q and q.strip()]))
+                t_exp = time.perf_counter()
+
+                # 2) Hibrit retrieval (TR + EN varyantları, multi-query RRF).
                 contexts = self.embedder.multi_query_search(queries, k=self.TOP_K)
-                t1 = time.perf_counter()
+                t_ret = time.perf_counter()
+
+                # 3) LLM cevabı.
                 response = self.llm.ask(question, contexts)
-                t2 = time.perf_counter()
+                t_gen = time.perf_counter()
 
             timings = {
-                "retrieval_s": round(t1 - t0, 2),
-                "generation_s": round(t2 - t1, 2),
-                "total_s": round(t2 - t0, 2),
+                "query_expansion_s": round(t_exp - t0, 2),
+                "retrieval_s": round(t_ret - t_exp, 2),
+                "generation_s": round(t_gen - t_ret, 2),
+                "total_s": round(t_gen - t0, 2),
             }
             perf_text = format_perf_block(timings, response.meta, sampler.summary())
             return response, contexts, perf_text
@@ -884,24 +965,26 @@ class GemiAsistaniApp(*_APP_BASES):
 
             answer = response.text
             # Kaynak/cevap çelişkisini önle: model "dokümanda bulunmuyor" dediyse
-            # "Kaynaklar" listesi yanıltıcı olur. Bu durumda kaynakları, yalnızca
-            # DEĞERLENDİRİLEN (doğrudan kaynaklık etmemiş olabilecek) parçalar olarak
-            # ve net bir notla göster.
+            # "Kaynaklar" listesi yanıltıcı olur. Bu durumda kaynak GÖSTERME.
+            # Sadece gerçekten kaynaklı bir cevap varsa "Kaynaklar:" eklenir.
+            ans_low = (response.text or "").lower()
+            not_found = any(m in ans_low for m in (
+                "dokümanlarda bulunmuyor", "dokümanda bulunmuyor",
+                "dokümanlarda bulunmamakta", "dokümanda bulunmamakta",
+                "dokümanlarda yok", "belgelerde bulunmuyor",
+                "bağlamda bulunmuyor", "bağlamda bulunmamakta",
+                "dokümanlarda yer almıyor", "dokümanlarda yer almamakta",
+            ))
             if contexts:
                 sources = sorted({
                     f"{c.source}" + (f" (s.{c.page})" if c.page else "")
                     for c in contexts
                 })
-                ans_low = (response.text or "").lower()
-                not_found = any(m in ans_low for m in (
-                    "dokümanlarda bulunmuyor", "dokümanda bulunmuyor",
-                    "dokümanlarda yok", "belgelerde bulunmuyor",
-                ))
-                if not_found:
-                    answer += ("\n\nDeğerlendirilen kaynaklar (cevaba doğrudan "
-                               "kaynaklık etmedi): " + ", ".join(sources))
-                else:
+                if not not_found:
                     answer += "\n\nKaynaklar: " + ", ".join(sources)
+                elif self.DEBUG_SOURCES:
+                    answer += ("\n\n[DEBUG] Değerlendirilen kaynaklar (cevaba "
+                               "kaynaklık etmedi): " + ", ".join(sources))
             answer += "\n\n" + perf_text
             self.chat.update_message(thinking_label, answer)
 

@@ -116,6 +116,7 @@ def format_perf_block(timings: dict, meta: dict, res: dict) -> str:
     it = meta.get("input_tokens")
     ot = meta.get("output_tokens")
     tt = meta.get("total_tokens")
+    exp = timings.get("query_expansion_s")
     ret = timings.get("retrieval_s")
     gen = timings.get("generation_s")
     tot = timings.get("total_s")
@@ -129,7 +130,8 @@ def format_perf_block(timings: dict, meta: dict, res: dict) -> str:
         "──────────────── PERFORMANS ÖLÇÜMÜ ────────────────",
         f"{'Model':<6}: {model_line}",
         f"{'Token':<6}: girdi {_v(it)} · çıktı {_v(ot)} · toplam {_v(tt)}",
-        f"{'Süre':<6}: getirme {_v(ret, ' s')} · üretim {_v(gen, ' s')} · toplam {_v(tot, ' s')}",
+        f"{'Süre':<6}: " + (f"genişletme {_v(exp, ' s')} · " if exp is not None else "")
+        + f"getirme {_v(ret, ' s')} · üretim {_v(gen, ' s')} · toplam {_v(tot, ' s')}",
         f"{'Hız':<6}: {_v(tps, ' tok/sn')}",
         f"{'CPU':<6}: ort %{_v(res.get('cpu_avg'))} · max %{_v(res.get('cpu_max'))}",
         f"{'RAM':<6}: ort {_v(res.get('ram_avg_mb'), ' MB')} · max {_v(res.get('ram_max_mb'), ' MB')}",
